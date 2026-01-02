@@ -43,7 +43,7 @@
 
 ```bash
 # 下载脚本
-wget https://example.com/vps2arch-cn.sh
+wget https://raw.githubusercontent.com/wanayla/vps2arch/main/vps2arch-cn.sh
 chmod +x vps2arch-cn.sh
 
 # 运行（使用默认镜像源）

@@ -43,7 +43,7 @@ Convert any Linux VPS to Arch Linux online, supporting x86_64 and ARM64 architec
 
 ```bash
 # Download script
-wget https://example.com/vps2arch.sh
+wget https://raw.githubusercontent.com/wanayla/vps2arch/main/vps2arch.sh
 chmod +x vps2arch.sh
 
 # Run (using default mirror)
