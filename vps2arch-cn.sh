@@ -485,12 +485,12 @@ EOF
     log_info "安装基本系统包..."
     if [[ "$ARCH" == "x86_64" ]]; then
         chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux linux-firmware openssh grub dhcpcd nano wget curl fastfetch btop
+            pacman -Sy --noconfirm base linux linux-firmware openssh grub dhcpcd nano wget curl fastfetch btop ncurses
         "
     elif [[ "$ARCH" == "aarch64" ]]; then
         # ARM64 使用 linux-aarch64 内核，不使用 grub
         chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux-aarch64 linux-firmware openssh dhcpcd nano wget curl fastfetch btop
+            pacman -Sy --noconfirm base linux-aarch64 linux-firmware openssh dhcpcd nano wget curl fastfetch btop ncurses
         "
     fi
 }
@@ -586,7 +586,11 @@ EOF
 
 setup_ssh() {
     log_info "配置 SSH..."
-    
+
+    # 创建 sshd 权限分离目录（关键！否则 sshd 无法启动）
+    mkdir -p "${NEW_ROOT}/usr/share/empty.sshd"
+    chmod 755 "${NEW_ROOT}/usr/share/empty.sshd"
+
     # 恢复 authorized_keys（使用新系统生成的主机密钥）
     mkdir -p "${NEW_ROOT}/root/.ssh"
     chmod 700 "${NEW_ROOT}/root/.ssh"
@@ -666,6 +670,22 @@ setup_locale_timezone_alias() {
     echo "LANG=en_US.UTF-8" > "${NEW_ROOT}/etc/locale.conf"
     log_info "Locale 已设置为 en_US.UTF-8"
 
+    # 设置控制台配置（键盘布局、字体等）
+    cat > "${NEW_ROOT}/etc/vconsole.conf" << 'EOF'
+# 键盘布局
+KEYMAP=us
+
+# 控制台字体（支持更多字符）
+FONT=ter-v16n
+FONT_MAP=8859-1
+EOF
+    log_info "控制台配置已设置（键盘布局: us, 字体: ter-v16n）"
+
+    # 安装 terminus 字体（提供 ter-v16n 等字体）
+    chroot "$NEW_ROOT" /bin/bash -c "
+        pacman -S --noconfirm terminus-font 2>/dev/null || true
+    "
+
     # 添加常用别名到 /etc/profile
     log_info "添加常用别名..."
     cat >> "${NEW_ROOT}/etc/profile" << 'EOF'
@@ -729,32 +749,196 @@ setup_bootloader() {
     # 获取根分区信息
     ROOT_DEV=$(findmnt -n -o SOURCE /)
     ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV")
+    ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
     BOOT_DISK=$(lsblk -no PKNAME "$ROOT_DEV" | head -n1)
     BOOT_DISK="/dev/${BOOT_DISK}"
     log_info "启动磁盘: $BOOT_DISK"
+    log_info "根分区 UUID: $ROOT_UUID"
+    log_info "根分区文件系统: $ROOT_FSTYPE"
+
+    # 检测内核文件名
+    if [[ "$ARCH" == "x86_64" ]]; then
+        KERNEL_FILE="vmlinuz-linux"
+    else
+        KERNEL_FILE="Image"
+    fi
+
+    # 生成 GRUB 配置的函数
+    generate_grub_config() {
+        local target_file="$1"
+        local kernel="$2"
+        cat > "$target_file" << GRUBCFG
+# GRUB 配置文件
+# 由 vps2arch 自动生成
+
+set default=0
+set timeout=5
+
+# 加载必要的模块
+insmod part_gpt
+insmod part_msdos
+insmod ${ROOT_FSTYPE}
+
+menuentry 'Arch Linux' --class arch --class gnu-linux --class os {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
+    initrd /boot/initramfs-linux.img
+}
+
+menuentry 'Arch Linux (fallback initramfs)' --class arch --class gnu-linux --class os {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
+    initrd /boot/initramfs-linux-fallback.img
+}
+GRUBCFG
+    }
 
     if [[ "$ARCH" == "x86_64" ]]; then
-        # x86_64: 安装 GRUB
-        # 始终尝试安装 BIOS 模式的 GRUB（兼容性）
-        log_info "安装 BIOS 模式 GRUB..."
-        chroot "$NEW_ROOT" /bin/bash -c "
-            grub-install --target=i386-pc ${BOOT_DISK} 2>/dev/null || echo 'BIOS GRUB 安装跳过（可能不支持）'
-        "
-
         # 检测是否有 EFI 支持
         if [[ -d /sys/firmware/efi ]]; then
-            log_info "检测到 UEFI 启动模式，同时安装 UEFI GRUB..."
+            log_info "检测到 UEFI 启动模式"
 
             # 查找 EFI 分区
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null)
+            EFI_DEV=""
+
+            # 方法1: 检查当前挂载的 EFI 分区
+            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
+
+            # 方法2: 检查 /boot 是否是 EFI 分区
             if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid | grep -i "EFI" | cut -d: -f1 | head -n1)
+                local boot_fstype=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+                if [[ "$boot_fstype" == "vfat" ]]; then
+                    EFI_DEV=$(findmnt -n -o SOURCE /boot 2>/dev/null)
+                fi
             fi
 
+            # 方法3: 通过分区类型查找 EFI 分区
             if [[ -z "$EFI_DEV" ]]; then
-                # 常见的 EFI 分区位置
-                for dev in /dev/sda15 /dev/sda1 /dev/vda15 /dev/vda1; do
-                    if [[ -b "$dev" ]] && blkid "$dev" | grep -qi "vfat"; then
+                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
+            fi
+
+            # 方法4: 通过 GPT 分区标签查找
+            if [[ -z "$EFI_DEV" ]]; then
+                for part in $(lsblk -ln -o NAME,PARTTYPE | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print $1}'); do
+                    EFI_DEV="/dev/$part"
+                    break
+                done
+            fi
+
+            # 方法5: 尝试常见位置
+            if [[ -z "$EFI_DEV" ]]; then
+                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
+                    if [[ -b "$dev" ]]; then
+                        local fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
+                        if [[ "$fstype" == "vfat" ]]; then
+                            EFI_DEV="$dev"
+                            log_info "通过常见位置找到 EFI 分区: $EFI_DEV"
+                            break
+                        fi
+                    fi
+                done
+            fi
+
+            if [[ -n "$EFI_DEV" ]]; then
+                log_info "EFI 分区: $EFI_DEV"
+                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
+                log_info "EFI 分区 UUID: $EFI_UUID"
+
+                # 挂载 EFI 分区到新系统
+                mkdir -p "${NEW_ROOT}/boot/efi"
+                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
+
+                # 添加 EFI 到 fstab
+                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
+                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
+                fi
+
+                # 安装 GRUB EFI
+                log_info "安装 GRUB EFI..."
+                chroot "$NEW_ROOT" /bin/bash -c "
+                    pacman -S --noconfirm efibootmgr dosfstools
+                    # 安装到标准 EFI 路径
+                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
+                    # 同时尝试非 removable 模式
+                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
+                "
+
+                # 生成根分区的 GRUB 配置
+                log_info "生成 GRUB 配置..."
+                mkdir -p "${NEW_ROOT}/boot/grub"
+                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+                # 在 EFI 分区也放置完整的 grub.cfg（关键修复！）
+                log_info "在 EFI 分区创建 GRUB 配置..."
+
+                # EFI/arch 目录（非 removable 模式）
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
+
+                # EFI/BOOT 目录（removable 模式 fallback）
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
+
+                # 验证 EFI 文件是否存在
+                log_info "验证 EFI 启动文件..."
+                if [[ -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]]; then
+                    log_info "找到 EFI/BOOT/BOOTX64.EFI ✓"
+                else
+                    log_warn "未找到 EFI/BOOT/BOOTX64.EFI，尝试复制..."
+                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" ]]; then
+                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI"
+                        log_info "已复制 grubx64.efi 到 BOOTX64.EFI"
+                    fi
+                fi
+
+                # 列出 EFI 分区内容用于调试
+                log_info "EFI 分区内容:"
+                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
+
+                # 备份 EFI 内容到工作目录（关键！在卸载前备份）
+                log_info "备份 EFI 内容到工作目录..."
+                mkdir -p "${WORK_DIR}/efi_content"
+                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
+
+                # 保存 EFI 设备路径
+                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
+
+                # 卸载 EFI 分区
+                sync
+                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+
+                log_info "UEFI GRUB 配置完成"
+            else
+                log_error "未找到 EFI 分区！UEFI 系统需要 EFI 分区才能启动"
+            fi
+        else
+            # BIOS 模式
+            log_info "检测到 BIOS 启动模式，安装 GRUB..."
+            chroot "$NEW_ROOT" /bin/bash -c "
+                grub-install --target=i386-pc ${BOOT_DISK}
+            "
+
+            # 生成 GRUB 配置
+            log_info "生成 GRUB 配置..."
+            mkdir -p "${NEW_ROOT}/boot/grub"
+            generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+            log_info "BIOS GRUB 配置完成"
+        fi
+
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        # ARM64
+        if [[ -d /sys/firmware/efi ]]; then
+            log_info "ARM64 UEFI 模式，安装 GRUB..."
+
+            # 查找 EFI 分区（与 x86_64 相同的逻辑）
+            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
+            if [[ -z "$EFI_DEV" ]]; then
+                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
+            fi
+            if [[ -z "$EFI_DEV" ]]; then
+                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15; do
+                    if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
                         EFI_DEV="$dev"
                         break
                     fi
@@ -763,106 +947,61 @@ setup_bootloader() {
 
             if [[ -n "$EFI_DEV" ]]; then
                 log_info "EFI 分区: $EFI_DEV"
+                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
 
-                # 在新系统中创建并挂载 EFI 目录
                 mkdir -p "${NEW_ROOT}/boot/efi"
                 mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
 
-                # 添加 EFI 到 fstab
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
                 if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    defaults        0      2" >> "${NEW_ROOT}/etc/fstab"
+                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
                 fi
 
                 chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm efibootmgr
-                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
+                    pacman -S --noconfirm grub efibootmgr dosfstools
+                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
+                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
                 "
 
-                # 卸载 EFI 分区
+                # 生成配置
+                log_info "生成 ARM64 GRUB 配置..."
+                mkdir -p "${NEW_ROOT}/boot/grub"
+                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+                # EFI 分区配置
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
+
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
+
+                # 验证并复制 EFI 文件
+                if [[ ! -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI" ]]; then
+                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" ]]; then
+                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI"
+                    fi
+                fi
+
+                # 列出 EFI 分区内容用于调试
+                log_info "ARM64 EFI 分区内容:"
+                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
+
+                # 备份 EFI 内容到工作目录（关键！在卸载前备份）
+                log_info "备份 EFI 内容到工作目录..."
+                mkdir -p "${WORK_DIR}/efi_content"
+                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
+
+                # 保存 EFI 设备路径
+                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
+
+                sync
                 umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+
+                log_info "ARM64 UEFI GRUB 配置完成"
             else
-                log_warn "未找到 EFI 分区，跳过 UEFI GRUB 安装"
+                log_error "未找到 EFI 分区！"
             fi
         else
-            log_info "未检测到 UEFI，仅使用 BIOS 模式"
-        fi
-
-        # 手动创建 GRUB 配置文件
-        log_info "生成 GRUB 配置..."
-        mkdir -p "${NEW_ROOT}/boot/grub"
-        cat > "${NEW_ROOT}/boot/grub/grub.cfg" << EOF
-# GRUB 配置文件
-set default=0
-set timeout=5
-
-menuentry 'Arch Linux' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/vmlinuz-linux root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux.img
-}
-
-menuentry 'Arch Linux (fallback)' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/vmlinuz-linux root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux-fallback.img
-}
-EOF
-        log_info "GRUB 配置已生成"
-
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        # ARM64: 大多数云 VPS 使用 UEFI + GRUB
-        if [[ -d /sys/firmware/efi ]]; then
-            log_info "ARM64 UEFI 模式，安装 GRUB..."
-
-            # 查找 EFI 分区
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null)
-            if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid | grep -i "EFI" | cut -d: -f1 | head -n1)
-            fi
-
-            if [[ -n "$EFI_DEV" ]]; then
-                log_info "EFI 分区: $EFI_DEV"
-
-                mkdir -p "${NEW_ROOT}/boot/efi"
-                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
-
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
-                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    defaults        0      2" >> "${NEW_ROOT}/etc/fstab"
-                fi
-
-                chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm grub efibootmgr
-                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
-                "
-
-                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
-            fi
-
-            # 手动创建 GRUB 配置
-            log_info "生成 ARM64 GRUB 配置..."
-            mkdir -p "${NEW_ROOT}/boot/grub"
-            cat > "${NEW_ROOT}/boot/grub/grub.cfg" << EOF
-# GRUB 配置文件 (ARM64)
-set default=0
-set timeout=5
-
-menuentry 'Arch Linux ARM' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/Image root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux.img
-}
-
-menuentry 'Arch Linux ARM (fallback)' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/Image root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux-fallback.img
-}
-EOF
-            log_info "ARM64 GRUB 配置已生成"
-        else
-            log_warn "ARM64 非 UEFI 模式，跳过 bootloader 配置（可能使用 U-Boot）"
+            log_warn "ARM64 非 UEFI 模式，跳过 bootloader 配置"
         fi
     fi
 }
@@ -889,6 +1028,74 @@ replace_system() {
     mkdir -p "$RAMDIR"
     mount -t tmpfs -o size=200M tmpfs "$RAMDIR" || log_error "挂载 tmpfs 失败"
     log_info "tmpfs 已挂载到 $RAMDIR"
+
+    # ========== 关键：处理 EFI 分区 ==========
+    EFI_PART_DEV=""
+    if [[ -d /sys/firmware/efi ]]; then
+        log_info "准备 EFI 分区数据..."
+
+        # 从 setup_bootloader 保存的文件读取 EFI 设备路径
+        if [[ -f "${WORK_DIR}/efi_device" ]]; then
+            EFI_PART_DEV=$(cat "${WORK_DIR}/efi_device")
+            log_info "EFI 分区设备（从配置读取）: $EFI_PART_DEV"
+        fi
+
+        # 如果没找到，尝试其他方法
+        if [[ -z "$EFI_PART_DEV" ]]; then
+            EFI_PART_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null | head -n1)
+        fi
+
+        if [[ -z "$EFI_PART_DEV" ]]; then
+            for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
+                if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
+                    EFI_PART_DEV="$dev"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$EFI_PART_DEV" ]]; then
+            log_info "EFI 分区设备: $EFI_PART_DEV"
+
+            # 从 WORK_DIR 复制 EFI 备份到 RAMDIR（setup_bootloader 已经备份过）
+            log_info "复制 EFI 内容到内存..."
+            mkdir -p "$RAMDIR/efi_backup"
+
+            if [[ -d "${WORK_DIR}/efi_content/EFI" ]]; then
+                cp -a "${WORK_DIR}/efi_content/EFI" "$RAMDIR/efi_backup/"
+                log_info "从工作目录复制 EFI 内容成功"
+            else
+                log_warn "工作目录中没有 EFI 备份，尝试从挂载点获取..."
+                mkdir -p /tmp/efi_mount
+                mount "$EFI_PART_DEV" /tmp/efi_mount 2>/dev/null || true
+                if [[ -d /tmp/efi_mount/EFI ]]; then
+                    cp -a /tmp/efi_mount/EFI "$RAMDIR/efi_backup/"
+                    log_info "从挂载点复制 EFI 内容"
+                fi
+                umount /tmp/efi_mount 2>/dev/null || true
+            fi
+
+            # 验证备份
+            if [[ -d "$RAMDIR/efi_backup/EFI" ]]; then
+                log_info "EFI 备份内容:"
+                find "$RAMDIR/efi_backup" -type f 2>/dev/null | head -15
+            else
+                log_error "EFI 备份失败！无法继续"
+            fi
+
+            # 卸载所有 EFI 相关挂载点
+            umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+            umount /boot/efi 2>/dev/null || true
+            umount /boot 2>/dev/null || true
+
+            log_info "EFI 数据已准备好"
+        else
+            log_error "未找到 EFI 分区！UEFI 系统无法启动"
+        fi
+    fi
+
+    # 保存 EFI 设备路径供 do_replace.sh 使用
+    echo "$EFI_PART_DEV" > "$RAMDIR/efi_device"
 
     # 复制 busybox 到内存
     log_info "复制 busybox 到内存..."
@@ -965,6 +1172,7 @@ REPLACE_SCRIPT
     cat >> "$RAMDIR/do_replace.sh" << REPLACE_SCRIPT
 
 NEW_ROOT="$NEW_ROOT"
+EFI_DEV="\$(cat \$RAMDIR/efi_device 2>/dev/null)"
 
 echo "========== 开始系统替换 =========="
 
@@ -997,6 +1205,46 @@ echo "复制新系统..."
 \$BB cp -a "\${NEW_ROOT}"/* /
 
 echo "同步磁盘..."
+\$BB sync
+
+# ========== 关键：恢复 EFI 分区内容 ==========
+if [ -n "\$EFI_DEV" ] && [ -d "\$RAMDIR/efi_backup/EFI" ]; then
+    echo "恢复 EFI 分区内容..."
+    echo "EFI 设备: \$EFI_DEV"
+
+    # 创建挂载点
+    \$BB mkdir -p /boot/efi
+
+    # 挂载 EFI 分区
+    \$BB mount -t vfat "\$EFI_DEV" /boot/efi
+    if [ \$? -eq 0 ]; then
+        echo "EFI 分区挂载成功"
+
+        # 清空 EFI 分区（保留 NvVars 等系统文件）
+        \$BB rm -rf /boot/efi/EFI 2>/dev/null || true
+
+        # 复制 EFI 内容
+        \$BB cp -a "\$RAMDIR/efi_backup/EFI" /boot/efi/
+        \$BB sync
+
+        # 验证
+        echo "EFI 分区恢复后内容:"
+        \$BB ls -la /boot/efi/EFI/ 2>/dev/null || echo "(无法列出)"
+        \$BB ls -la /boot/efi/EFI/BOOT/ 2>/dev/null || echo "(无法列出 BOOT)"
+
+        # 卸载
+        \$BB umount /boot/efi
+        echo "EFI 分区恢复完成"
+    else
+        echo "警告: EFI 分区挂载失败！"
+    fi
+else
+    echo "跳过 EFI 恢复（非 UEFI 或无备份）"
+fi
+
+echo "最终同步..."
+\$BB sync
+\$BB sleep 1
 \$BB sync
 
 # 重启

@@ -14,7 +14,7 @@ set -e
 # Configuration
 #=============================================================================
 
-# Arch Linux mirror (can be overridden by argument)
+# Arch Linux mirror (can be overridden by parameter)
 ARCH_MIRROR="${1:-https://mirrors.kernel.org/archlinux}"
 
 # Working directory
@@ -65,7 +65,7 @@ check_arch() {
             NEW_ROOT="${WORK_DIR}/root"
             ;;
         *)
-            log_error "Unsupported architecture: $arch (only x86_64 and aarch64 are supported)"
+            log_error "Unsupported architecture: $arch (only x86_64 and aarch64 supported)"
             ;;
     esac
     log_info "System architecture: $ARCH"
@@ -133,11 +133,11 @@ detect_os() {
     log_info "Detected OS type: $OS_TYPE (package manager: $PKG_MANAGER)"
 
     if [[ "$PKG_MANAGER" == "" ]]; then
-        log_error "Cannot detect OS type, current system is not supported"
+        log_error "Cannot detect OS type, current system not supported"
     fi
 }
 
-# Install dependency packages
+# Install dependencies
 install_deps() {
     local packages="$@"
     log_info "Installing dependencies: $packages"
@@ -164,12 +164,12 @@ install_deps() {
     esac
 }
 
-# Install busybox (prefer statically compiled version)
+# Install busybox (prefer static version)
 install_busybox() {
     BUSYBOX_OK=false
     BUSYBOX_STATIC=false
 
-    # Debian/Ubuntu has statically compiled version
+    # Debian/Ubuntu has static version
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         log_info "Installing busybox-static (Debian/Ubuntu)..."
         if apt-get install -y busybox-static; then
@@ -177,12 +177,12 @@ install_busybox() {
                 cp /bin/busybox "${WORK_DIR}/busybox"
                 BUSYBOX_OK=true
                 BUSYBOX_STATIC=true
-                log_info "busybox-static installed"
+                log_info "Installed busybox-static"
             fi
         fi
     fi
 
-    # OpenSUSE has statically compiled version
+    # OpenSUSE has static version
     if [[ "$BUSYBOX_OK" != "true" && "$PKG_MANAGER" == "zypper" ]]; then
         log_info "Installing busybox-static (OpenSUSE)..."
         if zypper install -y busybox-static; then
@@ -191,14 +191,14 @@ install_busybox() {
                 cp "$bb" "${WORK_DIR}/busybox"
                 BUSYBOX_OK=true
                 BUSYBOX_STATIC=true
-                log_info "busybox-static installed"
+                log_info "Installed busybox-static"
             fi
         fi
     fi
 
-    # Try to download statically compiled version
+    # Try downloading static version
     if [[ "$BUSYBOX_OK" != "true" ]]; then
-        log_info "Downloading statically compiled busybox..."
+        log_info "Downloading static busybox..."
 
         # Select download URL based on architecture
         if [[ "$ARCH" == "x86_64" ]]; then
@@ -247,7 +247,7 @@ install_busybox() {
             cp "$bb" "${WORK_DIR}/busybox"
             BUSYBOX_OK=true
             BUSYBOX_STATIC=false
-            log_info "Dynamic busybox installed: $bb"
+            log_info "Installed dynamic busybox: $bb"
         fi
     fi
 
@@ -260,13 +260,13 @@ install_busybox() {
 
     # Verify if statically compiled
     if file "${WORK_DIR}/busybox" | grep -q "statically linked"; then
-        log_info "busybox is statically compiled"
+        log_info "busybox is statically compiled ✓"
         BUSYBOX_STATIC=true
     elif ldd "${WORK_DIR}/busybox" 2>&1 | grep -q "not a dynamic"; then
-        log_info "busybox is statically compiled"
+        log_info "busybox is statically compiled ✓"
         BUSYBOX_STATIC=true
     else
-        log_warn "busybox is dynamically compiled, need to copy dependencies"
+        log_warn "busybox is dynamically compiled, need to copy libraries"
         BUSYBOX_STATIC=false
     fi
 
@@ -358,14 +358,14 @@ EOF
 #=============================================================================
 
 save_ssh_config() {
-    log_info "Saving SSH configuration..."
+    log_info "Saving SSH related information..."
 
     mkdir -p "${WORK_DIR}/ssh_backup"
 
-    # Only save authorized_keys (don't save old host keys)
+    # Only save authorized_keys (not old host keys)
     if [[ -f /root/.ssh/authorized_keys ]]; then
         cp -a /root/.ssh/authorized_keys "${WORK_DIR}/ssh_backup/" 2>/dev/null || true
-        log_info "authorized_keys saved"
+        log_info "Saved authorized_keys"
     fi
 
     # Save root password hash
@@ -407,13 +407,13 @@ download_bootstrap() {
     log_info "Downloading Bootstrap: $BOOTSTRAP_URL"
     if [[ "$ARCH" == "x86_64" ]]; then
         if ! wget -q --show-progress "$BOOTSTRAP_URL" -O archlinux-bootstrap.tar.zst; then
-            log_error "Download failed, please check network or mirror address"
+            log_error "Download failed, please check network or mirror URL"
         fi
         log_info "Extracting Bootstrap..."
         tar -I zstd -xf archlinux-bootstrap.tar.zst
     elif [[ "$ARCH" == "aarch64" ]]; then
         if ! wget -q --show-progress "$BOOTSTRAP_URL" -O archlinux-bootstrap.tar.gz; then
-            log_error "Download failed, please check network or mirror address"
+            log_error "Download failed, please check network or mirror URL"
         fi
         log_info "Extracting Bootstrap..."
         mkdir -p "$NEW_ROOT"
@@ -482,12 +482,12 @@ EOF
     log_info "Installing base system packages..."
     if [[ "$ARCH" == "x86_64" ]]; then
         chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux linux-firmware openssh grub dhcpcd nano wget curl fastfetch btop
+            pacman -Sy --noconfirm base linux linux-firmware openssh grub dhcpcd nano wget curl fastfetch btop ncurses
         "
     elif [[ "$ARCH" == "aarch64" ]]; then
-        # ARM64 uses linux-aarch64 kernel, doesn't use grub
+        # ARM64 uses linux-aarch64 kernel, no grub
         chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux-aarch64 linux-firmware openssh dhcpcd nano wget curl fastfetch btop
+            pacman -Sy --noconfirm base linux-aarch64 linux-firmware openssh dhcpcd nano wget curl fastfetch btop ncurses
         "
     fi
 }
@@ -499,7 +499,7 @@ EOF
 setup_network() {
     log_info "Configuring network..."
 
-    # Use dhcpcd for IPv4 management (simpler and more reliable than systemd-networkd)
+    # Use dhcpcd for IPv4 (simpler and more reliable than systemd-networkd)
     # Disable systemd-networkd to avoid conflicts
     chroot "$NEW_ROOT" /bin/bash -c "
         systemctl disable systemd-networkd 2>/dev/null || true
@@ -507,7 +507,7 @@ setup_network() {
         systemctl enable dhcpcd
     "
 
-    log_info "dhcpcd enabled for IPv4 management"
+    log_info "Enabled dhcpcd for IPv4 management"
 
     # Check if static IPv6 configuration is needed (/128 addresses usually need static config)
     if [[ -n "$IP6_ADDR" && "$IP6_ADDR" == *"/128" ]]; then
@@ -516,7 +516,7 @@ setup_network() {
         # Create systemd-networkd config for IPv6 only
         mkdir -p "${NEW_ROOT}/etc/systemd/network"
 
-        # Create MAC address based network config (ensures matching correct interface)
+        # Create network config based on MAC address (to match correct interface)
         cat > "${NEW_ROOT}/etc/systemd/network/10-ipv6-static.network" << EOF
 [Match]
 MACAddress=${MAC_ADDR}
@@ -549,7 +549,7 @@ EOF
             systemctl enable systemd-networkd
         "
 
-        log_info "Static IPv6 configured: ${IP6_ADDR} -> ${GATEWAY6}"
+        log_info "Configured static IPv6: ${IP6_ADDR} -> ${GATEWAY6}"
     fi
 
     # Configure resolv.conf
@@ -558,7 +558,7 @@ nameserver 8.8.8.8
 nameserver 2001:4860:4860::8888
 nameserver 1.1.1.1
 EOF
-    log_info "DNS configured"
+    log_info "Configured DNS"
 
     # Set hostname
     echo "$HOSTNAME" > "${NEW_ROOT}/etc/hostname"
@@ -583,19 +583,23 @@ EOF
 setup_ssh() {
     log_info "Configuring SSH..."
 
-    # Restore authorized_keys (use new system's generated host keys)
+    # Create sshd privilege separation directory (critical! sshd won't start without it)
+    mkdir -p "${NEW_ROOT}/usr/share/empty.sshd"
+    chmod 755 "${NEW_ROOT}/usr/share/empty.sshd"
+
+    # Restore authorized_keys (using new system generated host keys)
     mkdir -p "${NEW_ROOT}/root/.ssh"
     chmod 700 "${NEW_ROOT}/root/.ssh"
     if [[ -f "${WORK_DIR}/ssh_backup/authorized_keys" ]]; then
         cp -a "${WORK_DIR}/ssh_backup/authorized_keys" "${NEW_ROOT}/root/.ssh/"
         chmod 600 "${NEW_ROOT}/root/.ssh/authorized_keys"
-        log_info "authorized_keys restored"
+        log_info "Restored authorized_keys"
     fi
 
     # Set root password (required)
     echo ""
     log_info "========== Set root password =========="
-    echo -n "Enter new root password (press Enter for random password): "
+    echo -n "Enter root password for new system (press Enter for random password): "
     read -s NEW_ROOT_PASSWORD
     echo ""
 
@@ -611,14 +615,14 @@ setup_ssh() {
         echo "#                                          #"
         echo "############################################"
         echo ""
-        log_warn "Please save the password above! Continuing in 5 seconds..."
+        log_warn "Please save this password now! Continuing in 5 seconds..."
         sleep 5
     fi
 
     echo "root:${NEW_ROOT_PASSWORD}" | chroot "$NEW_ROOT" chpasswd
-    log_info "root password set"
+    log_info "Root password set"
 
-    # Use new system's default sshd_config, add custom config to allow root password login
+    # Use new system default sshd_config, add custom config to allow root password login
     mkdir -p "${NEW_ROOT}/etc/ssh/sshd_config.d"
     cat > "${NEW_ROOT}/etc/ssh/sshd_config.d/99-custom.conf" << 'EOF'
 # Allow root login
@@ -635,7 +639,7 @@ EOF
     chroot "$NEW_ROOT" /bin/bash -c "
         systemctl enable sshd.service
     "
-    log_info "SSH service enabled for auto-start"
+    log_info "SSH service set to start on boot"
 }
 
 #=============================================================================
@@ -645,7 +649,7 @@ EOF
 setup_locale_timezone_alias() {
     log_info "Configuring timezone and locale..."
 
-    # Set timezone to UTC (can be changed after installation)
+    # Set timezone to UTC (can be changed later)
     chroot "$NEW_ROOT" /bin/bash -c "
         ln -sf /usr/share/zoneinfo/UTC /etc/localtime
         hwclock --systohc
@@ -661,6 +665,22 @@ setup_locale_timezone_alias() {
 
     echo "LANG=en_US.UTF-8" > "${NEW_ROOT}/etc/locale.conf"
     log_info "Locale set to en_US.UTF-8"
+
+    # Set console configuration (keyboard layout, font, etc.)
+    cat > "${NEW_ROOT}/etc/vconsole.conf" << 'EOF'
+# Keyboard layout
+KEYMAP=us
+
+# Console font (supports more characters)
+FONT=ter-v16n
+FONT_MAP=8859-1
+EOF
+    log_info "Console configured (keyboard: us, font: ter-v16n)"
+
+    # Install terminus font (provides ter-v16n and other fonts)
+    chroot "$NEW_ROOT" /bin/bash -c "
+        pacman -S --noconfirm terminus-font 2>/dev/null || true
+    "
 
     # Add common aliases to /etc/profile
     log_info "Adding common aliases..."
@@ -720,37 +740,201 @@ EOF
 #=============================================================================
 
 setup_bootloader() {
-    log_info "Configuring bootloader..."
+    log_info "Configuring Bootloader..."
 
     # Get root partition info
     ROOT_DEV=$(findmnt -n -o SOURCE /)
     ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV")
+    ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
     BOOT_DISK=$(lsblk -no PKNAME "$ROOT_DEV" | head -n1)
     BOOT_DISK="/dev/${BOOT_DISK}"
     log_info "Boot disk: $BOOT_DISK"
+    log_info "Root partition UUID: $ROOT_UUID"
+    log_info "Root partition filesystem: $ROOT_FSTYPE"
+
+    # Detect kernel filename
+    if [[ "$ARCH" == "x86_64" ]]; then
+        KERNEL_FILE="vmlinuz-linux"
+    else
+        KERNEL_FILE="Image"
+    fi
+
+    # Function to generate GRUB config
+    generate_grub_config() {
+        local target_file="$1"
+        local kernel="$2"
+        cat > "$target_file" << GRUBCFG
+# GRUB configuration file
+# Auto-generated by vps2arch
+
+set default=0
+set timeout=5
+
+# Load required modules
+insmod part_gpt
+insmod part_msdos
+insmod ${ROOT_FSTYPE}
+
+menuentry 'Arch Linux' --class arch --class gnu-linux --class os {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
+    initrd /boot/initramfs-linux.img
+}
+
+menuentry 'Arch Linux (fallback initramfs)' --class arch --class gnu-linux --class os {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
+    initrd /boot/initramfs-linux-fallback.img
+}
+GRUBCFG
+    }
 
     if [[ "$ARCH" == "x86_64" ]]; then
-        # x86_64: Install GRUB
-        # Always try to install BIOS mode GRUB (for compatibility)
-        log_info "Installing BIOS mode GRUB..."
-        chroot "$NEW_ROOT" /bin/bash -c "
-            grub-install --target=i386-pc ${BOOT_DISK} 2>/dev/null || echo 'BIOS GRUB installation skipped (may not be supported)'
-        "
-
         # Check for EFI support
         if [[ -d /sys/firmware/efi ]]; then
-            log_info "UEFI boot mode detected, also installing UEFI GRUB..."
+            log_info "Detected UEFI boot mode"
 
             # Find EFI partition
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null)
+            EFI_DEV=""
+
+            # Method 1: Check currently mounted EFI partition
+            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
+
+            # Method 2: Check if /boot is EFI partition
             if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid | grep -i "EFI" | cut -d: -f1 | head -n1)
+                local boot_fstype=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+                if [[ "$boot_fstype" == "vfat" ]]; then
+                    EFI_DEV=$(findmnt -n -o SOURCE /boot 2>/dev/null)
+                fi
             fi
 
+            # Method 3: Find by partition type
             if [[ -z "$EFI_DEV" ]]; then
-                # Common EFI partition locations
-                for dev in /dev/sda15 /dev/sda1 /dev/vda15 /dev/vda1; do
-                    if [[ -b "$dev" ]] && blkid "$dev" | grep -qi "vfat"; then
+                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
+            fi
+
+            # Method 4: Find by GPT partition label
+            if [[ -z "$EFI_DEV" ]]; then
+                for part in $(lsblk -ln -o NAME,PARTTYPE | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print $1}'); do
+                    EFI_DEV="/dev/$part"
+                    break
+                done
+            fi
+
+            # Method 5: Try common locations
+            if [[ -z "$EFI_DEV" ]]; then
+                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
+                    if [[ -b "$dev" ]]; then
+                        local fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
+                        if [[ "$fstype" == "vfat" ]]; then
+                            EFI_DEV="$dev"
+                            log_info "Found EFI partition at common location: $EFI_DEV"
+                            break
+                        fi
+                    fi
+                done
+            fi
+
+            if [[ -n "$EFI_DEV" ]]; then
+                log_info "EFI partition: $EFI_DEV"
+                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
+                log_info "EFI partition UUID: $EFI_UUID"
+
+                # Mount EFI partition to new system
+                mkdir -p "${NEW_ROOT}/boot/efi"
+                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
+
+                # Add EFI to fstab
+                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
+                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
+                fi
+
+                # Install GRUB EFI
+                log_info "Installing GRUB EFI..."
+                chroot "$NEW_ROOT" /bin/bash -c "
+                    pacman -S --noconfirm efibootmgr dosfstools
+                    # Install to standard EFI path
+                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
+                    # Also try non-removable mode
+                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
+                "
+
+                # Generate GRUB config for root partition
+                log_info "Generating GRUB configuration..."
+                mkdir -p "${NEW_ROOT}/boot/grub"
+                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+                # Also place complete grub.cfg in EFI partition (critical fix!)
+                log_info "Creating GRUB config in EFI partition..."
+
+                # EFI/arch directory (non-removable mode)
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
+
+                # EFI/BOOT directory (removable mode fallback)
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
+
+                # Verify EFI files exist
+                log_info "Verifying EFI boot files..."
+                if [[ -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]]; then
+                    log_info "Found EFI/BOOT/BOOTX64.EFI ✓"
+                else
+                    log_warn "EFI/BOOT/BOOTX64.EFI not found, trying to copy..."
+                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" ]]; then
+                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI"
+                        log_info "Copied grubx64.efi to BOOTX64.EFI"
+                    fi
+                fi
+
+                # List EFI partition contents for debugging
+                log_info "EFI partition contents:"
+                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
+
+                # Backup EFI content to work directory (critical! backup before unmount)
+                log_info "Backing up EFI content to work directory..."
+                mkdir -p "${WORK_DIR}/efi_content"
+                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
+
+                # Save EFI device path
+                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
+
+                # Unmount EFI partition
+                sync
+                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+
+                log_info "UEFI GRUB configuration complete"
+            else
+                log_error "EFI partition not found! UEFI systems require EFI partition to boot"
+            fi
+        else
+            # BIOS mode
+            log_info "Detected BIOS boot mode, installing GRUB..."
+            chroot "$NEW_ROOT" /bin/bash -c "
+                grub-install --target=i386-pc ${BOOT_DISK}
+            "
+
+            # Generate GRUB config
+            log_info "Generating GRUB configuration..."
+            mkdir -p "${NEW_ROOT}/boot/grub"
+            generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+            log_info "BIOS GRUB configuration complete"
+        fi
+
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        # ARM64
+        if [[ -d /sys/firmware/efi ]]; then
+            log_info "ARM64 UEFI mode, installing GRUB..."
+
+            # Find EFI partition (same logic as x86_64)
+            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
+            if [[ -z "$EFI_DEV" ]]; then
+                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
+            fi
+            if [[ -z "$EFI_DEV" ]]; then
+                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15; do
+                    if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
                         EFI_DEV="$dev"
                         break
                     fi
@@ -759,106 +943,61 @@ setup_bootloader() {
 
             if [[ -n "$EFI_DEV" ]]; then
                 log_info "EFI partition: $EFI_DEV"
+                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
 
-                # Create and mount EFI directory in new system
                 mkdir -p "${NEW_ROOT}/boot/efi"
                 mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
 
-                # Add EFI to fstab
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
                 if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    defaults        0      2" >> "${NEW_ROOT}/etc/fstab"
+                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
                 fi
 
                 chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm efibootmgr
-                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
+                    pacman -S --noconfirm grub efibootmgr dosfstools
+                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
+                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
                 "
 
-                # Unmount EFI partition
+                # Generate config
+                log_info "Generating ARM64 GRUB configuration..."
+                mkdir -p "${NEW_ROOT}/boot/grub"
+                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
+
+                # EFI partition config
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
+
+                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
+                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
+
+                # Verify and copy EFI files
+                if [[ ! -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI" ]]; then
+                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" ]]; then
+                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI"
+                    fi
+                fi
+
+                # List EFI partition contents for debugging
+                log_info "ARM64 EFI partition contents:"
+                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
+
+                # Backup EFI content to work directory (critical! backup before unmount)
+                log_info "Backing up EFI content to work directory..."
+                mkdir -p "${WORK_DIR}/efi_content"
+                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
+
+                # Save EFI device path
+                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
+
+                sync
                 umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+
+                log_info "ARM64 UEFI GRUB configuration complete"
             else
-                log_warn "EFI partition not found, skipping UEFI GRUB installation"
+                log_error "EFI partition not found!"
             fi
         else
-            log_info "UEFI not detected, using BIOS mode only"
-        fi
-
-        # Manually create GRUB config file
-        log_info "Generating GRUB configuration..."
-        mkdir -p "${NEW_ROOT}/boot/grub"
-        cat > "${NEW_ROOT}/boot/grub/grub.cfg" << EOF
-# GRUB configuration file
-set default=0
-set timeout=5
-
-menuentry 'Arch Linux' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/vmlinuz-linux root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux.img
-}
-
-menuentry 'Arch Linux (fallback)' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/vmlinuz-linux root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux-fallback.img
-}
-EOF
-        log_info "GRUB configuration generated"
-
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        # ARM64: Most cloud VPS use UEFI + GRUB
-        if [[ -d /sys/firmware/efi ]]; then
-            log_info "ARM64 UEFI mode, installing GRUB..."
-
-            # Find EFI partition
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null)
-            if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid | grep -i "EFI" | cut -d: -f1 | head -n1)
-            fi
-
-            if [[ -n "$EFI_DEV" ]]; then
-                log_info "EFI partition: $EFI_DEV"
-
-                mkdir -p "${NEW_ROOT}/boot/efi"
-                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
-
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
-                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    defaults        0      2" >> "${NEW_ROOT}/etc/fstab"
-                fi
-
-                chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm grub efibootmgr
-                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
-                "
-
-                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
-            fi
-
-            # Manually create GRUB config
-            log_info "Generating ARM64 GRUB configuration..."
-            mkdir -p "${NEW_ROOT}/boot/grub"
-            cat > "${NEW_ROOT}/boot/grub/grub.cfg" << EOF
-# GRUB configuration file (ARM64)
-set default=0
-set timeout=5
-
-menuentry 'Arch Linux ARM' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/Image root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux.img
-}
-
-menuentry 'Arch Linux ARM (fallback)' {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/Image root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux-fallback.img
-}
-EOF
-            log_info "ARM64 GRUB configuration generated"
-        else
-            log_warn "ARM64 non-UEFI mode, skipping bootloader configuration (may use U-Boot)"
+            log_warn "ARM64 non-UEFI mode, skipping bootloader configuration"
         fi
     fi
 }
@@ -869,10 +1008,10 @@ EOF
 
 replace_system() {
     log_info "Preparing to replace system..."
-    log_warn "This is an irreversible operation! Starting in 5 seconds..."
+    log_warn "This is irreversible! Starting in 5 seconds..."
     sleep 5
 
-    # Sync filesystem
+    # Sync filesystems
     sync
 
     # Create RAM temporary directory
@@ -886,14 +1025,82 @@ replace_system() {
     mount -t tmpfs -o size=200M tmpfs "$RAMDIR" || log_error "Failed to mount tmpfs"
     log_info "tmpfs mounted at $RAMDIR"
 
-    # Copy busybox to RAM
-    log_info "Copying busybox to RAM..."
+    # ========== Critical: Handle EFI partition ==========
+    EFI_PART_DEV=""
+    if [[ -d /sys/firmware/efi ]]; then
+        log_info "Preparing EFI partition data..."
+
+        # Read EFI device path from file saved by setup_bootloader
+        if [[ -f "${WORK_DIR}/efi_device" ]]; then
+            EFI_PART_DEV=$(cat "${WORK_DIR}/efi_device")
+            log_info "EFI partition device (from config): $EFI_PART_DEV"
+        fi
+
+        # If not found, try other methods
+        if [[ -z "$EFI_PART_DEV" ]]; then
+            EFI_PART_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null | head -n1)
+        fi
+
+        if [[ -z "$EFI_PART_DEV" ]]; then
+            for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
+                if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
+                    EFI_PART_DEV="$dev"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$EFI_PART_DEV" ]]; then
+            log_info "EFI partition device: $EFI_PART_DEV"
+
+            # Copy EFI backup from WORK_DIR to RAMDIR (setup_bootloader already backed up)
+            log_info "Copying EFI content to memory..."
+            mkdir -p "$RAMDIR/efi_backup"
+
+            if [[ -d "${WORK_DIR}/efi_content/EFI" ]]; then
+                cp -a "${WORK_DIR}/efi_content/EFI" "$RAMDIR/efi_backup/"
+                log_info "Copied EFI content from work directory"
+            else
+                log_warn "No EFI backup in work directory, trying mount point..."
+                mkdir -p /tmp/efi_mount
+                mount "$EFI_PART_DEV" /tmp/efi_mount 2>/dev/null || true
+                if [[ -d /tmp/efi_mount/EFI ]]; then
+                    cp -a /tmp/efi_mount/EFI "$RAMDIR/efi_backup/"
+                    log_info "Copied EFI content from mount point"
+                fi
+                umount /tmp/efi_mount 2>/dev/null || true
+            fi
+
+            # Verify backup
+            if [[ -d "$RAMDIR/efi_backup/EFI" ]]; then
+                log_info "EFI backup contents:"
+                find "$RAMDIR/efi_backup" -type f 2>/dev/null | head -15
+            else
+                log_error "EFI backup failed! Cannot continue"
+            fi
+
+            # Unmount all EFI related mount points
+            umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
+            umount /boot/efi 2>/dev/null || true
+            umount /boot 2>/dev/null || true
+
+            log_info "EFI data ready"
+        else
+            log_error "EFI partition not found! UEFI system cannot boot"
+        fi
+    fi
+
+    # Save EFI device path for do_replace.sh
+    echo "$EFI_PART_DEV" > "$RAMDIR/efi_device"
+
+    # Copy busybox to memory
+    log_info "Copying busybox to memory..."
     cp "${WORK_DIR}/busybox" "$RAMDIR/busybox" || log_error "Failed to copy busybox"
     chmod +x "$RAMDIR/busybox"
 
-    # If dynamically compiled busybox, need to copy dependencies
+    # If dynamically compiled busybox, need to copy libraries
     if [[ "$BUSYBOX_STATIC" != "true" ]]; then
-        log_info "busybox is dynamically compiled, copying dependencies..."
+        log_info "busybox is dynamically compiled, copying libraries..."
 
         # Get dynamic linker path
         LD_LINUX=""
@@ -911,12 +1118,12 @@ replace_system() {
         # Copy dynamic linker
         cp -L "$LD_LINUX" "$RAMDIR/ld-linux.so"
         chmod +x "$RAMDIR/ld-linux.so"
-        log_info "Dynamic linker copied: $LD_LINUX"
+        log_info "Copied dynamic linker: $LD_LINUX"
 
         # Copy busybox dependencies
         mkdir -p "$RAMDIR/lib"
         ldd "${WORK_DIR}/busybox" 2>/dev/null | while read line; do
-            # Extract library file path
+            # Extract library path
             lib=$(echo "$line" | grep -oE '/[^ ]+' | head -1)
             if [[ -n "$lib" && -f "$lib" ]]; then
                 cp -L "$lib" "$RAMDIR/lib/" 2>/dev/null || true
@@ -961,12 +1168,13 @@ REPLACE_SCRIPT
     cat >> "$RAMDIR/do_replace.sh" << REPLACE_SCRIPT
 
 NEW_ROOT="$NEW_ROOT"
+EFI_DEV="\$(cat \$RAMDIR/efi_device 2>/dev/null)"
 
 echo "========== Starting system replacement =========="
 
 # Verify new system files exist
 if [ ! -d "\${NEW_ROOT}/bin" ]; then
-    echo "Error: New system files not found, aborting"
+    echo "Error: New system files do not exist, aborting"
     exit 1
 fi
 echo "New system files verified"
@@ -993,6 +1201,46 @@ echo "Copying new system..."
 \$BB cp -a "\${NEW_ROOT}"/* /
 
 echo "Syncing disk..."
+\$BB sync
+
+# ========== Critical: Restore EFI partition content ==========
+if [ -n "\$EFI_DEV" ] && [ -d "\$RAMDIR/efi_backup/EFI" ]; then
+    echo "Restoring EFI partition content..."
+    echo "EFI device: \$EFI_DEV"
+
+    # Create mount point
+    \$BB mkdir -p /boot/efi
+
+    # Mount EFI partition
+    \$BB mount -t vfat "\$EFI_DEV" /boot/efi
+    if [ \$? -eq 0 ]; then
+        echo "EFI partition mounted successfully"
+
+        # Clear EFI partition (preserve NvVars and other system files)
+        \$BB rm -rf /boot/efi/EFI 2>/dev/null || true
+
+        # Copy EFI content
+        \$BB cp -a "\$RAMDIR/efi_backup/EFI" /boot/efi/
+        \$BB sync
+
+        # Verify
+        echo "EFI partition content after restore:"
+        \$BB ls -la /boot/efi/EFI/ 2>/dev/null || echo "(cannot list)"
+        \$BB ls -la /boot/efi/EFI/BOOT/ 2>/dev/null || echo "(cannot list BOOT)"
+
+        # Unmount
+        \$BB umount /boot/efi
+        echo "EFI partition restore complete"
+    else
+        echo "Warning: Failed to mount EFI partition!"
+    fi
+else
+    echo "Skipping EFI restore (non-UEFI or no backup)"
+fi
+
+echo "Final sync..."
+\$BB sync
+\$BB sleep 1
 \$BB sync
 
 # Reboot
@@ -1043,13 +1291,13 @@ main() {
         exit 0
     fi
 
-    # Execute checks
+    # Run checks
     check_root
     check_arch
     check_virt
     detect_os
 
-    # Save configurations
+    # Save configuration
     save_network_config
     save_ssh_config
 
