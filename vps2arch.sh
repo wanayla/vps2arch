@@ -464,6 +464,12 @@ EOF
     mount --rbind /dev "${NEW_ROOT}/dev"
     mount --rbind /run "${NEW_ROOT}/run"
 
+    # Ensure pacman required directories exist
+    log_info "Creating pacman required directories..."
+    mkdir -p "${NEW_ROOT}/var/lib/pacman/sync"
+    mkdir -p "${NEW_ROOT}/var/cache/pacman/pkg"
+    mkdir -p "${NEW_ROOT}/var/log"
+
     # Initialize pacman keys
     log_info "Initializing pacman keys..."
     if [[ "$ARCH" == "x86_64" ]]; then

@@ -467,6 +467,12 @@ EOF
     mount --rbind /dev "${NEW_ROOT}/dev"
     mount --rbind /run "${NEW_ROOT}/run"
     
+    # 确保 pacman 必要目录存在
+    log_info "创建 pacman 必要目录..."
+    mkdir -p "${NEW_ROOT}/var/lib/pacman/sync"
+    mkdir -p "${NEW_ROOT}/var/cache/pacman/pkg"
+    mkdir -p "${NEW_ROOT}/var/log"
+
     # 初始化 pacman 密钥
     log_info "初始化 pacman 密钥..."
     if [[ "$ARCH" == "x86_64" ]]; then
