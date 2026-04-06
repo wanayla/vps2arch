@@ -1,503 +1,522 @@
 #!/bin/bash
 #
-# vps2arch-cn.sh - 将任意 Linux VPS 在线转换为 Arch Linux
+# vps2arch-cn.sh - 在线将任意 Linux VPS 转换为 Arch Linux
 #
+# 基于 vps2arch (Timothy Redaelli)
 # 许可证: GPL-3.0
-# 用法: ./vps2arch-cn.sh [镜像地址]
+# 用法: ./vps2arch-cn.sh [-m 镜像地址] [-b 引导程序] [-n 网络配置]
 #
-# 警告: 此脚本会完全替换当前系统！
+# 警告: 此脚本将完全替换当前系统！
 #
 
 set -e
 
 #=============================================================================
-# 配置区域
+# 配置
 #=============================================================================
 
-# Arch Linux 镜像源（可通过参数覆盖）
-ARCH_MIRROR="${1:-https://mirrors.kernel.org/archlinux}"
-
-# 工作目录
-WORK_DIR="/tmp/vps2arch"
-
-# 架构相关变量（在 check_arch 中设置）
-ARCH=""
-BOOTSTRAP_URL=""
-NEW_ROOT=""
+ARCH_MIRROR=""
+BOOTLOADER="grub"
+NETWORK="systemd-networkd"
 
 #=============================================================================
 # 工具函数
 #=============================================================================
 
 log_info() {
-    echo -e "\033[32m[INFO]\033[0m $1"
+    echo -e "\033[32m[信息]\033[0m $1"
 }
 
 log_warn() {
-    echo -e "\033[33m[WARN]\033[0m $1"
+    echo -e "\033[33m[警告]\033[0m $1"
 }
 
 log_error() {
-    echo -e "\033[31m[ERROR]\033[0m $1"
+    echo -e "\033[31m[错误]\033[0m $1"
     exit 1
 }
 
-# 检查是否为 root 用户
+# 下载工具（支持 wget 和 curl）
+if command -v wget >/dev/null 2>&1; then
+    _download() { wget -O- "$@" ; }
+elif command -v curl >/dev/null 2>&1; then
+    _download() { curl -fL "$@" ; }
+else
+    echo "此脚本需要 curl 或 wget" >&2
+    exit 2
+fi
+
+# 确保 zstd 可用
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "正在安装 zstd..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y zstd
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y zstd
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y zstd
+    fi
+fi
+
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "无法通过包管理器安装 zstd，尝试下载静态二进制文件..." >&2
+    _download "https://people.redhat.com/~tredaell/zstd" > /usr/bin/zstd
+    chmod +x /usr/bin/zstd
+fi
+
+#=============================================================================
+# 镜像源函数
+#=============================================================================
+
+get_worldwide_mirrors() {
+    # 使用稳定的静态镜像列表，避免动态获取的 Worldwide 列表中
+    # 包含不稳定的服务器（如 fastly.mirror.pkgbuild.com）
+    echo "https://mirrors.tuna.tsinghua.edu.cn/archlinux"
+    echo "https://mirrors.ustc.edu.cn/archlinux"
+    echo "https://mirrors.aliyun.com/archlinux"
+    echo "https://geo.mirror.pkgbuild.com"
+}
+
+download() {
+    local path="$1"
+    shift
+    for m in $mirrors; do
+        _download "$m/$path" && return 0
+    done
+    return 1
+}
+
+#=============================================================================
+# 环境检测
+#=============================================================================
+
+cpu_type=$(uname -m)
+
+is_openvz() { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }
+is_lxc() { grep -aqw container=lxc /proc/1/environ 2>/dev/null; }
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "此脚本必须以 root 身份运行"
     fi
 }
 
-# 检查系统架构
-check_arch() {
-    local arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)
-            ARCH="x86_64"
-            BOOTSTRAP_URL="${ARCH_MIRROR}/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
-            NEW_ROOT="${WORK_DIR}/root.x86_64"
-            ;;
-        aarch64|arm64)
-            ARCH="aarch64"
-            # ARM64 使用 Arch Linux ARM
-            BOOTSTRAP_URL="http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
-            NEW_ROOT="${WORK_DIR}/root"
-            ;;
-        *)
-            log_error "不支持的架构: $arch (仅支持 x86_64 和 aarch64)"
-            ;;
-    esac
-    log_info "系统架构: $ARCH"
-}
+#=============================================================================
+# 低内存支持
+#=============================================================================
 
-# 检查是否为虚拟化环境
-check_virt() {
-    if command -v systemd-detect-virt &>/dev/null; then
-        local virt=$(systemd-detect-virt)
-        log_info "虚拟化类型: $virt"
+ensure_enough_memory() {
+    local mem_total_kb swap_total_kb total_kb
+    mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    swap_total_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+    total_kb=$((mem_total_kb + swap_total_kb))
+
+    # 安全运行至少需要 256MB（内存 + swap）
+    if [ "$total_kb" -lt 262144 ]; then
+        log_warn "检测到低内存（$(( mem_total_kb / 1024 ))MB 内存 + $(( swap_total_kb / 1024 ))MB swap）"
+        log_info "正在创建临时 swap 文件..."
+
+        local swap_size=$(( 512 - mem_total_kb / 1024 ))  # 补足到约 512MB
+        [ "$swap_size" -lt 256 ] && swap_size=256
+
+        if dd if=/dev/zero of=/vps2arch_swap bs=1M count="$swap_size" 2>/dev/null && \
+           chmod 600 /vps2arch_swap && \
+           mkswap /vps2arch_swap >/dev/null 2>&1 && \
+           swapon /vps2arch_swap 2>/dev/null; then
+            log_info "已创建 ${swap_size}MB 临时 swap"
+        else
+            log_warn "无法创建 swap（VPS 可能不支持）。继续尝试..."
+        fi
     fi
 }
 
-# 检测当前系统类型
-detect_os() {
-    OS_TYPE="unknown"
-    PKG_MANAGER=""
+#=============================================================================
+# 下载并解压 Bootstrap
+#=============================================================================
 
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        case "$ID" in
-            arch|manjaro|endeavouros)
-                OS_TYPE="arch"
-                PKG_MANAGER="pacman"
-                ;;
-            debian|ubuntu|linuxmint|pop)
-                OS_TYPE="debian"
-                PKG_MANAGER="apt"
-                ;;
-            centos|rhel|rocky|almalinux|oracle)
-                OS_TYPE="rhel"
-                if command -v dnf &>/dev/null; then
-                    PKG_MANAGER="dnf"
-                else
-                    PKG_MANAGER="yum"
-                fi
-                ;;
-            fedora)
-                OS_TYPE="fedora"
-                PKG_MANAGER="dnf"
-                ;;
-            opensuse*|sles)
-                OS_TYPE="suse"
-                PKG_MANAGER="zypper"
-                ;;
-            *)
-                # 尝试通过包管理器检测
-                if command -v pacman &>/dev/null; then
-                    OS_TYPE="arch"
-                    PKG_MANAGER="pacman"
-                elif command -v apt-get &>/dev/null; then
-                    OS_TYPE="debian"
-                    PKG_MANAGER="apt"
-                elif command -v dnf &>/dev/null; then
-                    OS_TYPE="rhel"
-                    PKG_MANAGER="dnf"
-                elif command -v yum &>/dev/null; then
-                    OS_TYPE="rhel"
-                    PKG_MANAGER="yum"
-                fi
-                ;;
-        esac
-    fi
+download_and_extract_bootstrap() {
+    ensure_enough_memory
+    log_info "正在下载 Arch Linux Bootstrap..."
+    cd /
 
-    log_info "检测到系统类型: $OS_TYPE (包管理器: $PKG_MANAGER)"
+    download iso/latest/sha256sums.txt | grep -F "$cpu_type.tar.zst" > "sha256sums.txt"
+    read -r _ bootstrap_filename < "sha256sums.txt"
 
-    if [[ "$PKG_MANAGER" == "" ]]; then
-        log_error "无法检测系统类型，不支持当前系统"
-    fi
-}
+    # 下载并校验，失败自动重试
+    local max_retries=3 retry=0 download_ok=0
+    while [ $retry -lt $max_retries ]; do
+        retry=$((retry + 1))
+        log_info "正在下载 $bootstrap_filename（第 $retry/$max_retries 次尝试）..."
 
-# 安装依赖包
-install_deps() {
-    local packages="$@"
-    log_info "安装依赖: $packages"
-
-    case "$PKG_MANAGER" in
-        pacman)
-            pacman -Sy --noconfirm $packages
-            ;;
-        apt)
-            apt-get update && apt-get install -y $packages
-            ;;
-        yum)
-            yum install -y $packages
-            ;;
-        dnf)
-            dnf install -y $packages
-            ;;
-        zypper)
-            zypper install -y $packages
-            ;;
-        *)
-            log_error "不支持的包管理器: $PKG_MANAGER"
-            ;;
-    esac
-}
-
-# 安装 busybox（优先静态编译版本）
-install_busybox() {
-    BUSYBOX_OK=false
-    BUSYBOX_STATIC=false
-
-    # Debian/Ubuntu 有静态编译版本
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        log_info "安装 busybox-static (Debian/Ubuntu)..."
-        if apt-get install -y busybox-static; then
-            if [[ -f /bin/busybox ]]; then
-                cp /bin/busybox "${WORK_DIR}/busybox"
-                BUSYBOX_OK=true
-                BUSYBOX_STATIC=true
-                log_info "已安装 busybox-static"
+        if download "iso/latest/$bootstrap_filename" > "$bootstrap_filename" && [ -s "$bootstrap_filename" ]; then
+            if grep -F "$bootstrap_filename" sha256sums.txt | sha256sum -c; then
+                log_info "校验和验证通过"
+                download_ok=1
+                break
+            else
+                log_warn "校验和验证失败（第 $retry/$max_retries 次尝试）"
+                rm -f "$bootstrap_filename"
             fi
+        else
+            log_warn "下载失败或文件为空（第 $retry/$max_retries 次尝试）"
+            rm -f "$bootstrap_filename"
+        fi
+    done
+
+    if [ $download_ok -ne 1 ]; then
+        log_error "经过 $max_retries 次尝试仍无法下载 Bootstrap，请检查网络和镜像源。"
+    fi
+
+    log_info "正在解压 Bootstrap..."
+    # 先解压以捕获 zstd 错误（管道可能隐藏失败）
+    # 使用 --memory 限制内存使用，支持低内存系统（128MB）
+    local tar_file="${bootstrap_filename%.zst}"
+    if ! zstd -d --memory=100MB "$bootstrap_filename" -o "$tar_file" 2>/dev/null; then
+        # 旧版 zstd 不支持 --memory，回退到默认模式
+        if ! zstd -d "$bootstrap_filename" -o "$tar_file"; then
+            log_error "解压 Bootstrap 失败（请检查可用内存和 zstd 版本）"
         fi
     fi
+    rm -f "$bootstrap_filename"
 
-    # OpenSUSE 有静态编译版本
-    if [[ "$BUSYBOX_OK" != "true" && "$PKG_MANAGER" == "zypper" ]]; then
-        log_info "安装 busybox-static (OpenSUSE)..."
-        if zypper install -y busybox-static; then
-            local bb=$(command -v busybox 2>/dev/null)
-            if [[ -n "$bb" ]]; then
-                cp "$bb" "${WORK_DIR}/busybox"
-                BUSYBOX_OK=true
-                BUSYBOX_STATIC=true
-                log_info "已安装 busybox-static"
-            fi
-        fi
+    if ! tar --warning=no-unknown-keyword -xpf "$tar_file"; then
+        log_error "解压 Bootstrap tarball 失败"
     fi
+    rm -f "$tar_file" sha256sums.txt
 
-    # 尝试下载静态编译版本
-    if [[ "$BUSYBOX_OK" != "true" ]]; then
-        log_info "下载静态编译的 busybox..."
-
-        # 根据架构选择下载地址
-        if [[ "$ARCH" == "x86_64" ]]; then
-            BUSYBOX_URLS=(
-                "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
-                "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-x86_64"
-            )
-        elif [[ "$ARCH" == "aarch64" ]]; then
-            BUSYBOX_URLS=(
-                "https://busybox.net/downloads/binaries/1.35.0-aarch64-linux-musl/busybox"
-                "https://busybox.net/downloads/binaries/1.31.0-defconfig-multiarch-musl/busybox-armv8l"
-            )
-        fi
-
-        for url in "${BUSYBOX_URLS[@]}"; do
-            log_info "尝试: $url"
-            if wget -q --timeout=30 "$url" -O "${WORK_DIR}/busybox" 2>/dev/null; then
-                if [[ -s "${WORK_DIR}/busybox" ]]; then
-                    BUSYBOX_OK=true
-                    BUSYBOX_STATIC=true
-                    log_info "下载成功"
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # 最后尝试：从包管理器安装动态版本
-    if [[ "$BUSYBOX_OK" != "true" ]]; then
-        log_warn "无法获取静态版本，尝试安装动态版本..."
-
-        case "$PKG_MANAGER" in
-            pacman)
-                pacman -Sy --noconfirm busybox
-                ;;
-            yum)
-                yum install -y busybox
-                ;;
-            dnf)
-                dnf install -y busybox
-                ;;
-        esac
-
-        local bb=$(command -v busybox 2>/dev/null)
-        if [[ -n "$bb" && -f "$bb" ]]; then
-            cp "$bb" "${WORK_DIR}/busybox"
-            BUSYBOX_OK=true
-            BUSYBOX_STATIC=false
-            log_info "已安装动态版本 busybox: $bb"
-        fi
-    fi
-
-    # 最终检查
-    if [[ "$BUSYBOX_OK" != "true" ]]; then
-        log_error "无法获取 busybox。请手动下载到 ${WORK_DIR}/busybox"
-    fi
-
-    chmod +x "${WORK_DIR}/busybox"
-
-    # 验证是否静态编译
-    if file "${WORK_DIR}/busybox" | grep -q "statically linked"; then
-        log_info "busybox 是静态编译 ✓"
-        BUSYBOX_STATIC=true
-    elif ldd "${WORK_DIR}/busybox" 2>&1 | grep -q "not a dynamic"; then
-        log_info "busybox 是静态编译 ✓"
-        BUSYBOX_STATIC=true
+    # 复制 DNS 配置，如果检测到本地 stub resolver（如 systemd-resolved 的
+    # 127.0.0.53），则替换为公共 DNS，因为 chroot 内无法使用本地解析器
+    if grep -qE '^\s*nameserver\s+127\.' /etc/resolv.conf 2>/dev/null; then
+        log_warn "检测到本地 stub resolver，使用公共 DNS 替代"
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\n' \
+            > "/root.$cpu_type/etc/resolv.conf"
     else
-        log_warn "busybox 是动态编译，需要拷贝依赖库"
-        BUSYBOX_STATIC=false
+        cp -L /etc/resolv.conf "/root.$cpu_type/etc"
     fi
 
-    # 导出变量供后续使用
-    export BUSYBOX_STATIC
+    # 挂载文件系统（与 arch-chroot 相同的挂载选项）
+    log_info "正在为 chroot 挂载文件系统..."
+    mount -t proc proc -o nosuid,noexec,nodev "/root.$cpu_type/proc"
+    mount -t sysfs sys -o nosuid,noexec,nodev,ro "/root.$cpu_type/sys"
+    mount -t devtmpfs -o mode=0755,nosuid udev "/root.$cpu_type/dev"
+    mkdir -p "/root.$cpu_type/dev/pts" "/root.$cpu_type/dev/shm"
+    mount -t devpts -o mode=0620,gid=5,nosuid,noexec devpts "/root.$cpu_type/dev/pts"
+    mount -t tmpfs -o mode=1777,nosuid,nodev shm "/root.$cpu_type/dev/shm"
+    mount -t tmpfs -o nosuid,nodev,mode=0755 run "/root.$cpu_type/run"
+    mount -t tmpfs -o mode=1777,strictatime,nodev,nosuid tmp "/root.$cpu_type/tmp"
+
+    # 将根文件系统绑定挂载到 chroot 内的 /mnt
+    mount --bind / "/root.$cpu_type/mnt"
+    findmnt /boot >/dev/null && mount --bind /boot "/root.$cpu_type/mnt/boot"
+    findmnt /boot/efi >/dev/null && mount --bind /boot/efi "/root.$cpu_type/mnt/boot/efi"
+
+    # 兼容性修复
+    mkdir -p "/root.$cpu_type/run/shm"
+    rm -f "/root.$cpu_type/etc/mtab"
+    cp -L /etc/mtab "/root.$cpu_type/etc/mtab"
+}
+
+chroot_exec() {
+    chroot "/root.$cpu_type" /bin/bash -c "$*"
 }
 
 #=============================================================================
-# 网络配置保存
+# 配置 Chroot 环境
 #=============================================================================
+
+configure_chroot() {
+    log_info "正在配置 chroot 环境..."
+
+    # 配置镜像源
+    for m in $mirrors; do
+        echo "Server = $m/\$repo/os/\$arch"
+    done >> "/root.$cpu_type/etc/pacman.d/mirrorlist"
+
+    # 确保 pacman 所需目录存在
+    mkdir -p "/root.$cpu_type/var/lib/pacman/sync"
+    mkdir -p "/root.$cpu_type/var/cache/pacman/pkg"
+    mkdir -p "/root.$cpu_type/var/log"
+
+    # 如有需要，安装并初始化 haveged
+    if ! is_openvz && ! pidof haveged >/dev/null 2>&1; then
+        sed -i.bak "s/^[[:space:]]*SigLevel[[:space:]]*=.*$/SigLevel = Never/" "/root.$cpu_type/etc/pacman.conf"
+        chroot_exec 'pacman --needed --noconfirm -Sy haveged && haveged' || true
+        mv "/root.$cpu_type/etc/pacman.conf.bak" "/root.$cpu_type/etc/pacman.conf"
+    fi
+
+    chroot_exec 'pacman-key --init && pacman-key --populate archlinux'
+    chroot_exec 'pacman --needed --noconfirm -Sy archlinux-keyring'
+
+    # 从当前挂载生成 fstab
+    chroot_exec 'genfstab /mnt >> /etc/fstab'
+}
+
+#=============================================================================
+# 保存当前系统状态
+#=============================================================================
+
+save_root_pass() {
+    log_info "正在保存 root 密码..."
+    grep '^root:' /etc/shadow > "/root.$cpu_type/root.passwd"
+    chmod 0600 "/root.$cpu_type/root.passwd"
+}
 
 save_network_config() {
-    log_info "保存当前网络配置..."
+    log_info "正在保存网络配置..."
 
-    mkdir -p "${WORK_DIR}/network_backup"
+    mkdir -p "/root.$cpu_type/network_backup"
 
-    # 获取默认网卡
-    DEFAULT_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-
-    # 获取网卡 MAC 地址
+    # 获取默认网卡和网络信息
+    DEFAULT_IFACE=$(ip route | awk '/default/ {print $5; exit}')
+    MAC_ADDR=""
     if [[ -n "$DEFAULT_IFACE" ]]; then
-        MAC_ADDR=$(ip link show "$DEFAULT_IFACE" | grep link/ether | awk '{print $2}')
+        MAC_ADDR=$(ip link show "$DEFAULT_IFACE" | awk '/link\/ether/ {print $2}')
     fi
 
-    # 获取 IP 地址和掩码
-    IP_ADDR=$(ip -4 addr show "$DEFAULT_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
+    IP_ADDR=$(ip -4 addr show "$DEFAULT_IFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
+    IP6_ADDR=$(ip -6 addr show "$DEFAULT_IFACE" scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+/\d+' | head -n1)
+    GATEWAY=$(ip route | awk '/default/ {print $3; exit}')
+    GATEWAY6=$(ip -6 route 2>/dev/null | awk '/default/ {print $3; exit}')
 
-    # 获取 IPv6 地址
-    IP6_ADDR=$(ip -6 addr show "$DEFAULT_IFACE" scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+/\d+' | head -n1)
-
-    # 获取网关
-    GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
-
-    # 获取 IPv6 网关
-    GATEWAY6=$(ip -6 route | grep default | awk '{print $3}' | head -n1)
-
-    # 获取 DNS
-    if [[ -f /etc/resolv.conf ]]; then
-        DNS_SERVERS=$(grep "^nameserver" /etc/resolv.conf | awk '{print $2}' | head -n2)
-    fi
-
-    # 获取主机名
     if [[ -f /etc/hostname ]]; then
-        HOSTNAME=$(cat /etc/hostname)
+        ORIG_HOSTNAME=$(cat /etc/hostname)
     elif command -v hostname &>/dev/null; then
-        HOSTNAME=$(hostname)
+        ORIG_HOSTNAME=$(hostname)
     else
-        HOSTNAME="archlinux"
+        ORIG_HOSTNAME="archlinux"
     fi
 
-    log_info "网卡: $DEFAULT_IFACE"
-    log_info "MAC 地址: $MAC_ADDR"
-    log_info "IPv4 地址: $IP_ADDR"
-    log_info "IPv4 网关: $GATEWAY"
-    log_info "IPv6 地址: $IP6_ADDR"
-    log_info "IPv6 网关: $GATEWAY6"
-    log_info "DNS: $DNS_SERVERS"
-    log_info "主机名: $HOSTNAME"
+    log_info "网卡: $DEFAULT_IFACE | IPv4: $IP_ADDR | 网关: $GATEWAY"
+    log_info "IPv6: $IP6_ADDR | IPv6 网关: $GATEWAY6"
 
-    # 保存完整的网络状态
-    ip addr show > "${WORK_DIR}/network_backup/ip_addr.txt"
-    ip route show > "${WORK_DIR}/network_backup/ip_route.txt"
-    ip -6 route show > "${WORK_DIR}/network_backup/ip6_route.txt" 2>/dev/null || true
+    # 保存网络状态
+    ip addr show > "/root.$cpu_type/network_backup/ip_addr.txt" 2>/dev/null || true
+    ip route show > "/root.$cpu_type/network_backup/ip_route.txt" 2>/dev/null || true
+    ip -6 route show > "/root.$cpu_type/network_backup/ip6_route.txt" 2>/dev/null || true
 
-    # 复制原系统网络配置文件
-    cp -a /etc/resolv.conf "${WORK_DIR}/network_backup/" 2>/dev/null || true
-    cp -a /etc/network "${WORK_DIR}/network_backup/" 2>/dev/null || true
-    cp -a /etc/netplan "${WORK_DIR}/network_backup/" 2>/dev/null || true
-    cp -a /etc/systemd/network "${WORK_DIR}/network_backup/" 2>/dev/null || true
-    cp -a /etc/sysconfig/network-scripts "${WORK_DIR}/network_backup/" 2>/dev/null || true
-
-    # 保存配置摘要
-    cat > "${WORK_DIR}/network_backup/summary.txt" << EOF
+    cat > "/root.$cpu_type/network_backup/summary.txt" << EOF
 IFACE=$DEFAULT_IFACE
 MAC=$MAC_ADDR
 IP=$IP_ADDR
 IP6=$IP6_ADDR
 GW=$GATEWAY
 GW6=$GATEWAY6
-DNS=$DNS_SERVERS
-HOSTNAME=$HOSTNAME
+HOSTNAME=$ORIG_HOSTNAME
 EOF
-
-    log_info "网络配置已完整备份到 ${WORK_DIR}/network_backup/"
 }
 
-#=============================================================================
-# SSH 配置保存
-#=============================================================================
-
-save_ssh_config() {
-    log_info "保存 SSH 相关信息..."
-    
-    mkdir -p "${WORK_DIR}/ssh_backup"
-    
-    # 只保存 authorized_keys（不保存旧的主机密钥）
+save_ssh_keys() {
+    log_info "正在保存 SSH 公钥..."
+    mkdir -p "/root.$cpu_type/ssh_backup"
     if [[ -f /root/.ssh/authorized_keys ]]; then
-        cp -a /root/.ssh/authorized_keys "${WORK_DIR}/ssh_backup/" 2>/dev/null || true
+        cp -a /root/.ssh/authorized_keys "/root.$cpu_type/ssh_backup/"
         log_info "已保存 authorized_keys"
     fi
-    
-    # 保存 root 密码哈希
-    ROOT_PASSWORD_HASH=$(grep "^root:" /etc/shadow | cut -d: -f2)
+}
+
+backup_old_files() {
+    cp -fL /etc/hostname /etc/localtime "/root.$cpu_type/etc/" 2>/dev/null || true
 }
 
 #=============================================================================
-# 下载并解压 Arch Bootstrap
+# 删除旧系统
 #=============================================================================
 
-download_bootstrap() {
-    log_info "创建工作目录..."
-    mkdir -p "$WORK_DIR"
-    cd "$WORK_DIR"
-    
-    log_info "下载 Arch Linux Bootstrap..."
-    log_info "URL: $BOOTSTRAP_URL"
-    
-    # 安装必要的依赖
-    local deps_to_install=""
-
-    # zstd 仅 x86_64 需要（ARM 使用 tar.gz）
-    if [[ "$ARCH" == "x86_64" ]] && ! command -v zstd &>/dev/null; then
-        deps_to_install+=" zstd"
+delete_all() {
+    log_info "正在删除旧系统文件..."
+    # 移除不可变标志
+    if command -v chattr >/dev/null 2>&1; then
+        find / -type f \( ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*" \) \
+            -exec chattr -i {} + 2>/dev/null || true
     fi
-
-    if ! command -v wget &>/dev/null; then
-        deps_to_install+=" wget"
-    fi
-
-    if [[ -n "$deps_to_install" ]]; then
-        install_deps $deps_to_install
-    fi
-
-    # 安装 busybox（用于系统替换阶段）
-    install_busybox
-    
-    # 下载 bootstrap
-    log_info "下载 Bootstrap: $BOOTSTRAP_URL"
-    if [[ "$ARCH" == "x86_64" ]]; then
-        if ! wget -q --show-progress "$BOOTSTRAP_URL" -O archlinux-bootstrap.tar.zst; then
-            log_error "下载失败，请检查网络或镜像地址"
-        fi
-        log_info "解压 Bootstrap..."
-        tar -I zstd -xf archlinux-bootstrap.tar.zst
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        if ! wget -q --show-progress "$BOOTSTRAP_URL" -O archlinux-bootstrap.tar.gz; then
-            log_error "下载失败，请检查网络或镜像地址"
-        fi
-        log_info "解压 Bootstrap..."
-        mkdir -p "$NEW_ROOT"
-        tar -xzf archlinux-bootstrap.tar.gz -C "$NEW_ROOT"
-    fi
-
-    if [[ ! -d "$NEW_ROOT" ]]; then
-        log_error "解压失败，未找到 $NEW_ROOT 目录"
-    fi
-    
-    log_info "Bootstrap 准备完成"
+    # 删除 bootstrap 和虚拟文件系统以外的所有文件
+    find / \( ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/selinux/*' -and ! -path "/root.$cpu_type/*" \) -delete 2>/dev/null || true
 }
 
 #=============================================================================
-# 配置新系统
+# 安装软件包
 #=============================================================================
 
-configure_new_system() {
-    log_info "配置新系统..."
-    
-    # 配置 pacman 镜像源
-    log_info "配置 pacman 镜像源..."
-    if [[ "$ARCH" == "x86_64" ]]; then
-        cat > "${NEW_ROOT}/etc/pacman.d/mirrorlist" << EOF
-# 镜像源列表
-Server = ${ARCH_MIRROR}/\$repo/os/\$arch
-Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/\$repo/os/\$arch
-Server = https://mirrors.ustc.edu.cn/archlinux/\$repo/os/\$arch
-Server = https://mirrors.aliyun.com/archlinux/\$repo/os/\$arch
-EOF
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        cat > "${NEW_ROOT}/etc/pacman.d/mirrorlist" << EOF
-# Arch Linux ARM 镜像源列表
-Server = http://mirror.archlinuxarm.org/\$arch/\$repo
-Server = https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/\$arch/\$repo
-Server = https://mirrors.ustc.edu.cn/archlinuxarm/\$arch/\$repo
-EOF
+install_packages() {
+    log_info "正在使用 pacstrap 安装软件包..."
+
+    local ld_so
+    set -- "/root.$cpu_type/usr/lib"/ld-*.so.2
+    ld_so=$1
+
+    # 基础软件包
+    set -- base openssh reflector
+
+    # 内核和 LVM（容器环境除外）
+    is_openvz || set -- "$@" linux linux-firmware lvm2
+
+    # 引导程序
+    [ "$BOOTLOADER" != "none" ] && set -- "$@" "$BOOTLOADER"
+    [ "$BOOTLOADER" = "syslinux" ] && set -- "$@" gptfdisk
+    [ -f /sys/firmware/efi/fw_platform_size ] && set -- "$@" efibootmgr
+
+    # 网络
+    [ "$NETWORK" = "netctl" ] && set -- "$@" netctl
+
+    # 额外软件包
+    set -- "$@" dhcpcd nano wget curl btop fastfetch
+
+    # 如需 XFS 支持
+    while read -r _ mountpoint filesystem _; do
+        [ "$mountpoint" = "/" ] && [ "$filesystem" = "xfs" ] && set -- "$@" xfsprogs
+    done < /proc/mounts
+
+    # 确保 /mnt/etc/resolv.conf 存在，pacstrap -M 不会自动 bind mount 它
+    # 必须使用 ld.so 技巧，因为宿主命令已被 delete_all 删除
+    "$ld_so" --library-path "/root.$cpu_type/usr/lib" \
+        "/root.$cpu_type/usr/bin/chroot" "/root.$cpu_type" \
+        /bin/bash -c 'mkdir -p /mnt/etc && cp -L /etc/resolv.conf /mnt/etc/resolv.conf'
+
+    # 使用 ld.so 技巧从 bootstrap 运行 pacstrap
+    "$ld_so" --library-path "/root.$cpu_type/usr/lib" \
+        "/root.$cpu_type/usr/bin/chroot" "/root.$cpu_type" /usr/bin/pacstrap -M /mnt "$@"
+}
+
+#=============================================================================
+# 恢复 Root 密码
+#=============================================================================
+
+restore_root_pass() {
+    log_info "正在恢复 root 密码..."
+    if grep -qE '^root:[^$]' "/root.$cpu_type/root.passwd"; then
+        echo "root:vps2arch" | chpasswd
+        log_info "root 密码已设置为: vps2arch"
+    else
+        sed -i '/^root:/d' /etc/shadow
+        cat "/root.$cpu_type/root.passwd" >> /etc/shadow
+        log_info "已恢复原始 root 密码"
+    fi
+}
+
+#=============================================================================
+# 清理
+#=============================================================================
+
+cleanup() {
+    log_info "正在清理 bootstrap 环境..."
+    mv "/root.$cpu_type/etc/fstab" "/etc/fstab"
+
+    # 复制备份文件到新系统
+    cp -a "/root.$cpu_type/network_backup" /root/ 2>/dev/null || true
+
+    # 恢复 SSH 公钥
+    if [[ -f "/root.$cpu_type/ssh_backup/authorized_keys" ]]; then
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        cp -a "/root.$cpu_type/ssh_backup/authorized_keys" /root/.ssh/
+        chmod 600 /root/.ssh/authorized_keys
+        log_info "已恢复 SSH authorized_keys"
     fi
 
-    # 配置 DNS（临时，用于 chroot 内联网）
-    cat > "${NEW_ROOT}/etc/resolv.conf" << EOF
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
+    # 卸载 chroot
+    awk "/\/root\.$cpu_type/ {print \$2}" /proc/mounts | sort -r | xargs umount -nl 2>/dev/null || true
+    rm -rf "/root.$cpu_type/"
+}
 
-    # 挂载必要的文件系统
-    log_info "挂载文件系统..."
-    mount --bind "$NEW_ROOT" "$NEW_ROOT"
-    mount -t proc /proc "${NEW_ROOT}/proc"
-    mount -t sysfs /sys "${NEW_ROOT}/sys"
-    mount --rbind /dev "${NEW_ROOT}/dev"
-    mount --rbind /run "${NEW_ROOT}/run"
-    
-    # 确保 pacman 必要目录存在
-    log_info "创建 pacman 必要目录..."
-    mkdir -p "${NEW_ROOT}/var/lib/pacman/sync"
-    mkdir -p "${NEW_ROOT}/var/cache/pacman/pkg"
-    mkdir -p "${NEW_ROOT}/var/log"
+#=============================================================================
+# 配置引导程序
+#=============================================================================
 
-    # 初始化 pacman 密钥
-    log_info "初始化 pacman 密钥..."
-    if [[ "$ARCH" == "x86_64" ]]; then
-        chroot "$NEW_ROOT" /bin/bash -c "
-            pacman-key --init
-            pacman-key --populate archlinux
-        "
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        chroot "$NEW_ROOT" /bin/bash -c "
-            pacman-key --init
-            pacman-key --populate archlinuxarm
-        "
+configure_bootloader() {
+    log_info "正在配置引导程序 ($BOOTLOADER)..."
+
+    local root_dev root_devs="" tmp needs_lvm2=0 uefi=0
+    root_dev=$(findmnt -no SOURCE /)
+
+    case $root_dev in
+    /dev/mapper/*) needs_lvm2=1 ;;
+    esac
+
+    if [ -f /sys/firmware/efi/fw_platform_size ]; then
+        uefi=$(cat /sys/firmware/efi/fw_platform_size)
     fi
-    
-    # 安装基本系统
-    log_info "安装基本系统包..."
-    if [[ "$ARCH" == "x86_64" ]]; then
-        chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux linux-firmware openssh grub dhcpcd nano wget curl fastfetch btop ncurses
-        "
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        # ARM64 使用 linux-aarch64 内核，不使用 grub
-        chroot "$NEW_ROOT" /bin/bash -c "
-            pacman -Sy --noconfirm base linux-aarch64 linux-firmware openssh dhcpcd nano wget curl fastfetch btop ncurses
-        "
+
+    if [ $needs_lvm2 -eq 1 ]; then
+        sed -i.bak 's/use_lvmetad = 1/use_lvmetad = 0/g' /etc/lvm/lvm.conf 2>/dev/null || true
+    fi
+
+    if [ "$BOOTLOADER" = "grub" ]; then
+        # 如果使用 eth* 网卡名，禁用新式网卡命名
+        grep -q '^[[:space:]]*eth' /proc/net/dev 2>/dev/null && \
+            sed -i.bak 's/GRUB_CMDLINE_LINUX_DEFAULT="/&net.ifnames=0 /' /etc/default/grub
+
+        # 使用控制台终端输出
+        sed -i.bak 's/^#GRUB_TERMINAL_OUTPUT=console/GRUB_TERMINAL_OUTPUT=console/' /etc/default/grub
+
+        if [ $needs_lvm2 -eq 1 ]; then
+            local vg=$(lvs --noheadings "$root_dev" 2>/dev/null | awk '{print $2}')
+            root_dev=$(pvs --noheadings 2>/dev/null | awk -v vg="$vg" '($2 == vg) { print $1 }')
+        fi
+
+        # 查找物理磁盘
+        for dev in $root_dev; do
+            tmp=$(lsblk -npsro TYPE,NAME "$dev" 2>/dev/null | awk '($1 == "disk") { print $2}')
+            case " $root_devs " in
+            *" $tmp "*) ;;
+            *) root_devs="${root_devs:+$root_devs }$tmp" ;;
+            esac
+        done
+
+        case $uefi in
+        0)
+            # BIOS 模式
+            for dev in $root_devs; do
+                log_info "正在将 GRUB 安装到 $dev (BIOS 模式)..."
+                grub-install --target=i386-pc --recheck --force "$dev"
+            done
+            ;;
+        32|64)
+            # UEFI 模式
+            log_info "正在安装 GRUB (UEFI 模式)..."
+            mkdir -p /boot/efi
+            findmnt /boot/efi >/dev/null 2>&1 || {
+                # 尝试查找并挂载 EFI 分区
+                local efi_dev=""
+                for dev in $(lsblk -ln -o NAME,PARTTYPE 2>/dev/null | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print $1}'); do
+                    efi_dev="/dev/$dev"
+                    break
+                done
+                if [[ -z "$efi_dev" ]]; then
+                    for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
+                        if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
+                            efi_dev="$dev"
+                            break
+                        fi
+                    done
+                fi
+                if [[ -n "$efi_dev" ]]; then
+                    mount "$efi_dev" /boot/efi
+                    log_info "已挂载 EFI 分区: $efi_dev"
+                fi
+            }
+            if [ "$uefi" = "64" ]; then
+                grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable 2>&1 || true
+                grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB 2>&1 || true
+            elif [ "$uefi" = "32" ]; then
+                grub-install --target=i386-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable 2>&1 || true
+                grub-install --target=i386-efi --efi-directory=/boot/efi --bootloader-id=GRUB 2>&1 || true
+            fi
+            ;;
+        esac
+
+        mkdir -p /boot/grub
+        grub-mkconfig -o /boot/grub/grub.cfg
+
+    elif [ "$BOOTLOADER" = "syslinux" ]; then
+        grep -q '^[[:space:]]*eth' /proc/net/dev 2>/dev/null && tmp="net.ifnames=0"
+        syslinux-install_update -ami
+        sed -i "s;\(^[[:space:]]*APPEND.*\)root=[^[:space:]]*;\1root=$root_dev${tmp:+ $tmp};" /boot/syslinux/syslinux.cfg
+    fi
+
+    if [ $needs_lvm2 -eq 1 ]; then
+        mv /etc/lvm/lvm.conf.bak /etc/lvm/lvm.conf 2>/dev/null || true
+        sed -i '/HOOKS/s/block/& lvm2/' /etc/mkinitcpio.conf
+        mkinitcpio -p linux
     fi
 }
 
@@ -505,824 +524,266 @@ EOF
 # 配置网络
 #=============================================================================
 
-setup_network() {
-    log_info "配置网络..."
+configure_network() {
+    log_info "正在配置网络 ($NETWORK)..."
 
-    # 使用 dhcpcd 管理 IPv4（比 systemd-networkd 更简单可靠）
-    # 禁用 systemd-networkd 避免冲突
-    chroot "$NEW_ROOT" /bin/bash -c "
-        systemctl disable systemd-networkd 2>/dev/null || true
-        systemctl disable systemd-resolved 2>/dev/null || true
-        systemctl enable dhcpcd
-    "
+    local dev gateway
+    read -r dev gateway <<-EOF
+		$(awk '$2 == "00000000" { ip = strtonum(sprintf("0x%s", $3));
+			printf ("%s\t%d.%d.%d.%d", $1,
+			rshift(and(ip,0x000000ff),00), rshift(and(ip,0x0000ff00),08),
+			rshift(and(ip,0x00ff0000),16), rshift(and(ip,0xff000000),24)) ; exit }' < /proc/net/route)
+	EOF
 
-    log_info "已启用 dhcpcd 管理 IPv4"
+    set -- "$(ip addr show dev "$dev" | awk '($1 == "inet") { print $2 }')"
+    local ips=$*
 
-    # 检测是否需要静态 IPv6 配置（/128 地址通常需要静态配置）
-    if [[ -n "$IP6_ADDR" && "$IP6_ADDR" == *"/128" ]]; then
-        log_info "检测到 /128 IPv6 地址，配置静态 IPv6..."
+    if [ "$NETWORK" = "systemd-networkd" ]; then
+        cat > /etc/systemd/network/default.network <<-EOF
+			[Match]
+			Name=$dev
 
-        # 获取网卡名（新系统可能使用不同的命名）
-        # 创建 systemd-networkd 配置仅用于 IPv6
-        mkdir -p "${NEW_ROOT}/etc/systemd/network"
+			[Network]
+			Gateway=$gateway
+		EOF
+        for ip in $ips; do
+            echo "Address=$ip"
+        done >> /etc/systemd/network/default.network
 
-        # 创建基于 MAC 地址的网络配置（确保匹配正确的网卡）
-        cat > "${NEW_ROOT}/etc/systemd/network/10-ipv6-static.network" << EOF
-[Match]
-MACAddress=${MAC_ADDR}
+        # 检查是否需要静态 IPv6 配置
+        local ip6=$(ip -6 addr show "$dev" scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+/\d+' | head -n1)
+        local gw6=$(ip -6 route 2>/dev/null | awk '/default/ {print $3; exit}')
+        if [[ -n "$ip6" && "$ip6" == *"/128" && -n "$gw6" ]]; then
+            cat >> /etc/systemd/network/default.network <<-EOF
 
-[Network]
-# IPv4 由 dhcpcd 管理
-DHCP=no
+				[Network]
+				Address=$ip6
+				Gateway=$gw6
+				IPv6AcceptRA=no
 
-# 静态 IPv6 配置
-Address=${IP6_ADDR}
-Gateway=${GATEWAY6}
-IPv6AcceptRA=no
+				[Route]
+				Destination=$gw6/128
+				Scope=link
+			EOF
+            log_info "已配置静态 IPv6: $ip6"
+        fi
 
-[Route]
-# OVH 等云服务商需要先添加网关的主机路由
-Destination=${GATEWAY6}/128
-Scope=link
-EOF
+        systemctl enable systemd-networkd
 
-        # 配置 dhcpcd 不管理 IPv6（避免冲突）
-        mkdir -p "${NEW_ROOT}/etc/dhcpcd.conf.d"
-        cat > "${NEW_ROOT}/etc/dhcpcd.conf.d/10-ipv4-only.conf" << EOF
-# 仅使用 dhcpcd 管理 IPv4，IPv6 由 systemd-networkd 管理
-noipv6
-noipv6rs
-EOF
-
-        # 启用 systemd-networkd 用于 IPv6
-        chroot "$NEW_ROOT" /bin/bash -c "
-            systemctl enable systemd-networkd
-        "
-
-        log_info "已配置静态 IPv6: ${IP6_ADDR} -> ${GATEWAY6}"
+    elif [ "$NETWORK" = "netctl" ]; then
+        cat > /etc/netctl/default <<-EOF
+			Interface=$dev
+			Connection=ethernet
+			IP=static
+			Address=($ips)
+		EOF
+        if [ "$gateway" = "0.0.0.0" ]; then
+            echo 'Routes=(0.0.0.0/0)'
+        else
+            echo "Gateway=$gateway"
+        fi >> /etc/netctl/default
+        netctl enable default
     fi
 
-    # 配置 resolv.conf
-    cat > "${NEW_ROOT}/etc/resolv.conf" << EOF
-nameserver 8.8.8.8
-nameserver 2001:4860:4860::8888
-nameserver 1.1.1.1
-EOF
-    log_info "已配置 DNS"
+    systemctl enable sshd
 
-    # 设置主机名
-    echo "$HOSTNAME" > "${NEW_ROOT}/etc/hostname"
-
-    # 配置 hosts
-    cat > "${NEW_ROOT}/etc/hosts" << EOF
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   ${HOSTNAME}
-EOF
-
-    # 复制网络配置备份到新系统（方便排查）
-    cp -a "${WORK_DIR}/network_backup" "${NEW_ROOT}/root/" 2>/dev/null || true
-
-    log_info "网络配置完成"
+    # 确保新系统 DNS 可用（resolv.conf 可能被 systemd 覆盖为指向未运行的 systemd-resolved 的符号链接）
+    if [[ ! -s /etc/resolv.conf ]] || readlink /etc/resolv.conf | grep -q systemd; then
+        rm -f /etc/resolv.conf
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\n' \
+            > /etc/resolv.conf
+    fi
 }
 
 #=============================================================================
 # 配置 SSH
 #=============================================================================
 
-setup_ssh() {
-    log_info "配置 SSH..."
+configure_ssh() {
+    log_info "正在配置 SSH..."
 
-    # 创建 sshd 权限分离目录（关键！否则 sshd 无法启动）
-    mkdir -p "${NEW_ROOT}/usr/share/empty.sshd"
-    chmod 755 "${NEW_ROOT}/usr/share/empty.sshd"
+    # 允许 root 登录
+    sed -i '/^#PermitRootLogin\s/s/.*/&\nPermitRootLogin yes/' /etc/ssh/sshd_config
 
-    # 恢复 authorized_keys（使用新系统生成的主机密钥）
-    mkdir -p "${NEW_ROOT}/root/.ssh"
-    chmod 700 "${NEW_ROOT}/root/.ssh"
-    if [[ -f "${WORK_DIR}/ssh_backup/authorized_keys" ]]; then
-        cp -a "${WORK_DIR}/ssh_backup/authorized_keys" "${NEW_ROOT}/root/.ssh/"
-        chmod 600 "${NEW_ROOT}/root/.ssh/authorized_keys"
-        log_info "已恢复 authorized_keys"
-    fi
-    
-    # 设置 root 密码（强制）
-    echo ""
-    log_info "========== 设置 root 密码 =========="
-    echo -n "请输入新系统的 root 密码（直接回车使用随机密码）: "
-    read -s NEW_ROOT_PASSWORD
-    echo ""
-
-    if [[ -z "$NEW_ROOT_PASSWORD" ]]; then
-        # 生成随机密码
-        NEW_ROOT_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
-        echo ""
-        echo "############################################"
-        echo "#                                          #"
-        echo "#   随机生成的 ROOT 密码（请务必记录）:    #"
-        echo "#                                          #"
-        echo "#   $NEW_ROOT_PASSWORD               #"
-        echo "#                                          #"
-        echo "############################################"
-        echo ""
-        log_warn "请立即记录以上密码！5秒后继续..."
-        sleep 5
-    fi
-
-    echo "root:${NEW_ROOT_PASSWORD}" | chroot "$NEW_ROOT" chpasswd
-    log_info "root 密码已设置"
-    
-    # 使用新系统默认 sshd_config，添加自定义配置允许 root 密码登录
-    mkdir -p "${NEW_ROOT}/etc/ssh/sshd_config.d"
-    cat > "${NEW_ROOT}/etc/ssh/sshd_config.d/99-custom.conf" << 'EOF'
-# 允许 root 登录
+    # 添加附加配置以确保可靠性
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/99-vps2arch.conf << 'EOF'
 PermitRootLogin yes
-
-# 允许密码认证
 PasswordAuthentication yes
 EOF
-    
-    log_info "已配置允许 root 密码登录"
-    
-    # 启用 SSH 服务（开机自启）
-    log_info "启用 SSH 服务..."
-    chroot "$NEW_ROOT" /bin/bash -c "
-        systemctl enable sshd.service
-    "
-    log_info "SSH 服务已设置为开机自启"
+
+    log_info "SSH 配置完成（已允许 root 登录）"
 }
 
 #=============================================================================
-# 配置时区和 Locale
+# 配置区域、时区和自定义设置
 #=============================================================================
 
-setup_locale_timezone_alias() {
-    log_info "配置时区和 Locale..."
-    
-    # 设置时区为 Asia/Shanghai
-    chroot "$NEW_ROOT" /bin/bash -c "
+configure_system() {
+    log_info "正在配置区域和时区..."
+
+    # 时区（尽量保留旧系统设置）
+    if [[ ! -f /etc/localtime ]]; then
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-        hwclock --systohc
-    "
-    log_info "时区已设置为 Asia/Shanghai"
-    
-    # 配置 locale
-    sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "${NEW_ROOT}/etc/locale.gen"
-    
-    chroot "$NEW_ROOT" /bin/bash -c "
-        locale-gen
-    "
-    
-    echo "LANG=en_US.UTF-8" > "${NEW_ROOT}/etc/locale.conf"
-    log_info "Locale 已设置为 en_US.UTF-8"
+    fi
 
-    # 设置控制台配置（键盘布局、字体等）
-    cat > "${NEW_ROOT}/etc/vconsole.conf" << 'EOF'
-# 键盘布局
-KEYMAP=us
+    # 区域设置
+    sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    locale-gen
+    echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-# 控制台字体（支持更多字符）
-FONT=ter-v16n
-FONT_MAP=8859-1
+    # 主机名
+    if [[ -n "$ORIG_HOSTNAME" ]] && [[ ! -f /etc/hostname ]]; then
+        echo "$ORIG_HOSTNAME" > /etc/hostname
+        cat > /etc/hosts << EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $ORIG_HOSTNAME
 EOF
-    log_info "控制台配置已设置（键盘布局: us, 字体: ter-v16n）"
+    fi
 
-    # 安装 terminus 字体（提供 ter-v16n 等字体）
-    chroot "$NEW_ROOT" /bin/bash -c "
-        pacman -S --noconfirm terminus-font 2>/dev/null || true
-    "
+    # 控制台
+    cat > /etc/vconsole.conf << 'EOF'
+KEYMAP=us
+EOF
 
-    # 添加常用别名到 /etc/profile
-    log_info "添加常用别名..."
-    cat >> "${NEW_ROOT}/etc/profile" << 'EOF'
+    # 常用别名
+    cat >> /etc/profile << 'EOF'
 
-# Custom aliases
+# 自定义别名
 alias ls='ls --color=auto'
-alias ll='ls -ls --color=auto'
-alias dir='dir --color=auto'
+alias ll='ls -la --color=auto'
 alias halt='halt -p'
 EOF
-    log_info "别名已添加到 /etc/profile"
-
-    # 创建 /root/.bash_profile，登录时显示系统信息
-    cat > "${NEW_ROOT}/root/.bash_profile" << 'EOF'
-# ~/.bash_profile
-
-# 加载 .bashrc
-[[ -f ~/.bashrc ]] && . ~/.bashrc
-
-# 显示系统信息
-fastfetch
-EOF
-    log_info "已配置 /root/.bash_profile（登录时运行 fastfetch）"
 }
 
 #=============================================================================
-# 配置 fstab
+# 完成
 #=============================================================================
 
-setup_fstab() {
-    log_info "配置 fstab..."
-    
-    # 获取根分区信息
-    ROOT_DEV=$(findmnt -n -o SOURCE /)
-    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV")
-    ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
-    
-    log_info "根分区: $ROOT_DEV (UUID=$ROOT_UUID, 类型=$ROOT_FSTYPE)"
-    
-    cat > "${NEW_ROOT}/etc/fstab" << EOF
-# /etc/fstab - 静态文件系统信息
-# <device>                                <dir>   <type>  <options>       <dump> <pass>
-UUID=${ROOT_UUID}   /       ${ROOT_FSTYPE}   defaults        0      1
-EOF
-
-    # 检查是否有 swap 分区
-    local swap_dev=$(swapon --show=NAME --noheadings 2>/dev/null | head -n1)
-    if [[ -n "$swap_dev" ]]; then
-        local swap_uuid=$(blkid -s UUID -o value "$swap_dev")
-        echo "UUID=${swap_uuid}   none    swap    defaults        0      0" >> "${NEW_ROOT}/etc/fstab"
+finalize() {
+    # OpenVZ 兼容性修复
+    if is_openvz; then
+        mkdir -p /etc/resolvconf/resolv.conf.d
     fi
+
+    # 运行 reflector 优化镜像源
+    if command -v reflector >/dev/null 2>&1; then
+        log_info "正在运行 reflector 优化镜像源..."
+        reflector -l 35 -p https --sort rate --save /etc/pacman.d/mirrorlist || true
+    fi
+
+    cat <<-EOF
+
+	==========================================
+	  Arch Linux 安装完成！
+	==========================================
+
+	引导程序: $BOOTLOADER
+	网络配置: $NETWORK
+
+	root 密码: 沿用原密码（若原系统无密码则为 "vps2arch"）
+
+	网络配置备份保存在: /root/network_backup/
+
+	完成后请重启虚拟机:
+	  sync ; reboot -f
+
+	然后使用 root 密码通过 SSH 连接。
+	==========================================
+	EOF
 }
 
 #=============================================================================
-# 安装 Bootloader
+# 解析参数
 #=============================================================================
 
-setup_bootloader() {
-    log_info "配置 Bootloader..."
-
-    # 获取根分区信息
-    ROOT_DEV=$(findmnt -n -o SOURCE /)
-    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_DEV")
-    ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
-    BOOT_DISK=$(lsblk -no PKNAME "$ROOT_DEV" | head -n1)
-    BOOT_DISK="/dev/${BOOT_DISK}"
-    log_info "启动磁盘: $BOOT_DISK"
-    log_info "根分区 UUID: $ROOT_UUID"
-    log_info "根分区文件系统: $ROOT_FSTYPE"
-
-    # 检测内核文件名
-    if [[ "$ARCH" == "x86_64" ]]; then
-        KERNEL_FILE="vmlinuz-linux"
-    else
-        KERNEL_FILE="Image"
-    fi
-
-    # 生成 GRUB 配置的函数
-    generate_grub_config() {
-        local target_file="$1"
-        local kernel="$2"
-        cat > "$target_file" << GRUBCFG
-# GRUB 配置文件
-# 由 vps2arch 自动生成
-
-set default=0
-set timeout=5
-
-# 加载必要的模块
-insmod part_gpt
-insmod part_msdos
-insmod ${ROOT_FSTYPE}
-
-menuentry 'Arch Linux' --class arch --class gnu-linux --class os {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux.img
-}
-
-menuentry 'Arch Linux (fallback initramfs)' --class arch --class gnu-linux --class os {
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /boot/${kernel} root=UUID=${ROOT_UUID} rw quiet
-    initrd /boot/initramfs-linux-fallback.img
-}
-GRUBCFG
-    }
-
-    if [[ "$ARCH" == "x86_64" ]]; then
-        # 检测是否有 EFI 支持
-        if [[ -d /sys/firmware/efi ]]; then
-            log_info "检测到 UEFI 启动模式"
-
-            # 查找 EFI 分区
-            EFI_DEV=""
-
-            # 方法1: 检查当前挂载的 EFI 分区
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
-
-            # 方法2: 检查 /boot 是否是 EFI 分区
-            if [[ -z "$EFI_DEV" ]]; then
-                local boot_fstype=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
-                if [[ "$boot_fstype" == "vfat" ]]; then
-                    EFI_DEV=$(findmnt -n -o SOURCE /boot 2>/dev/null)
-                fi
-            fi
-
-            # 方法3: 通过分区类型查找 EFI 分区
-            if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
-            fi
-
-            # 方法4: 通过 GPT 分区标签查找
-            if [[ -z "$EFI_DEV" ]]; then
-                for part in $(lsblk -ln -o NAME,PARTTYPE | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print $1}'); do
-                    EFI_DEV="/dev/$part"
-                    break
-                done
-            fi
-
-            # 方法5: 尝试常见位置
-            if [[ -z "$EFI_DEV" ]]; then
-                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
-                    if [[ -b "$dev" ]]; then
-                        local fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
-                        if [[ "$fstype" == "vfat" ]]; then
-                            EFI_DEV="$dev"
-                            log_info "通过常见位置找到 EFI 分区: $EFI_DEV"
-                            break
-                        fi
-                    fi
-                done
-            fi
-
-            if [[ -n "$EFI_DEV" ]]; then
-                log_info "EFI 分区: $EFI_DEV"
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
-                log_info "EFI 分区 UUID: $EFI_UUID"
-
-                # 挂载 EFI 分区到新系统
-                mkdir -p "${NEW_ROOT}/boot/efi"
-                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
-
-                # 添加 EFI 到 fstab
-                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
-                fi
-
-                # 安装 GRUB EFI
-                log_info "安装 GRUB EFI..."
-                chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm efibootmgr dosfstools
-                    # 安装到标准 EFI 路径
-                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
-                    # 同时尝试非 removable 模式
-                    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
-                "
-
-                # 生成根分区的 GRUB 配置
-                log_info "生成 GRUB 配置..."
-                mkdir -p "${NEW_ROOT}/boot/grub"
-                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
-
-                # 在 EFI 分区也放置完整的 grub.cfg（关键修复！）
-                log_info "在 EFI 分区创建 GRUB 配置..."
-
-                # EFI/arch 目录（非 removable 模式）
-                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
-                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
-
-                # EFI/BOOT 目录（removable 模式 fallback）
-                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
-                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
-
-                # 验证 EFI 文件是否存在
-                log_info "验证 EFI 启动文件..."
-                if [[ -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]]; then
-                    log_info "找到 EFI/BOOT/BOOTX64.EFI ✓"
-                else
-                    log_warn "未找到 EFI/BOOT/BOOTX64.EFI，尝试复制..."
-                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" ]]; then
-                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubx64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI"
-                        log_info "已复制 grubx64.efi 到 BOOTX64.EFI"
-                    fi
-                fi
-
-                # 列出 EFI 分区内容用于调试
-                log_info "EFI 分区内容:"
-                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
-
-                # 备份 EFI 内容到工作目录（关键！在卸载前备份）
-                log_info "备份 EFI 内容到工作目录..."
-                mkdir -p "${WORK_DIR}/efi_content"
-                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
-
-                # 保存 EFI 设备路径
-                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
-
-                # 卸载 EFI 分区
-                sync
-                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
-
-                log_info "UEFI GRUB 配置完成"
-            else
-                log_error "未找到 EFI 分区！UEFI 系统需要 EFI 分区才能启动"
-            fi
-        else
-            # BIOS 模式
-            log_info "检测到 BIOS 启动模式，安装 GRUB..."
-            chroot "$NEW_ROOT" /bin/bash -c "
-                grub-install --target=i386-pc ${BOOT_DISK}
-            "
-
-            # 生成 GRUB 配置
-            log_info "生成 GRUB 配置..."
-            mkdir -p "${NEW_ROOT}/boot/grub"
-            generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
-
-            log_info "BIOS GRUB 配置完成"
+while getopts ":b:m:n:h" opt; do
+    case $opt in
+    b)
+        if [ "$OPTARG" != "grub" ] && [ "$OPTARG" != "syslinux" ] && [ "$OPTARG" != "none" ]; then
+            echo "无效的引导程序: $OPTARG" >&2
+            exit 1
         fi
-
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        # ARM64
-        if [[ -d /sys/firmware/efi ]]; then
-            log_info "ARM64 UEFI 模式，安装 GRUB..."
-
-            # 查找 EFI 分区（与 x86_64 相同的逻辑）
-            EFI_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null)
-            if [[ -z "$EFI_DEV" ]]; then
-                EFI_DEV=$(blkid -t TYPE="vfat" | grep -i "EFI\|esp" | cut -d: -f1 | head -n1)
-            fi
-            if [[ -z "$EFI_DEV" ]]; then
-                for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15; do
-                    if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
-                        EFI_DEV="$dev"
-                        break
-                    fi
-                done
-            fi
-
-            if [[ -n "$EFI_DEV" ]]; then
-                log_info "EFI 分区: $EFI_DEV"
-                EFI_UUID=$(blkid -s UUID -o value "$EFI_DEV")
-
-                mkdir -p "${NEW_ROOT}/boot/efi"
-                mount "$EFI_DEV" "${NEW_ROOT}/boot/efi"
-
-                if ! grep -q "$EFI_UUID" "${NEW_ROOT}/etc/fstab"; then
-                    echo "UUID=${EFI_UUID}   /boot/efi   vfat    umask=0077      0      2" >> "${NEW_ROOT}/etc/fstab"
-                fi
-
-                chroot "$NEW_ROOT" /bin/bash -c "
-                    pacman -S --noconfirm grub efibootmgr dosfstools
-                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch --removable 2>&1 || true
-                    grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>&1 || true
-                "
-
-                # 生成配置
-                log_info "生成 ARM64 GRUB 配置..."
-                mkdir -p "${NEW_ROOT}/boot/grub"
-                generate_grub_config "${NEW_ROOT}/boot/grub/grub.cfg" "$KERNEL_FILE"
-
-                # EFI 分区配置
-                mkdir -p "${NEW_ROOT}/boot/efi/EFI/arch"
-                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/arch/grub.cfg" "$KERNEL_FILE"
-
-                mkdir -p "${NEW_ROOT}/boot/efi/EFI/BOOT"
-                generate_grub_config "${NEW_ROOT}/boot/efi/EFI/BOOT/grub.cfg" "$KERNEL_FILE"
-
-                # 验证并复制 EFI 文件
-                if [[ ! -f "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI" ]]; then
-                    if [[ -f "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" ]]; then
-                        cp "${NEW_ROOT}/boot/efi/EFI/arch/grubaa64.efi" "${NEW_ROOT}/boot/efi/EFI/BOOT/BOOTAA64.EFI"
-                    fi
-                fi
-
-                # 列出 EFI 分区内容用于调试
-                log_info "ARM64 EFI 分区内容:"
-                find "${NEW_ROOT}/boot/efi" -type f 2>/dev/null | head -20
-
-                # 备份 EFI 内容到工作目录（关键！在卸载前备份）
-                log_info "备份 EFI 内容到工作目录..."
-                mkdir -p "${WORK_DIR}/efi_content"
-                cp -a "${NEW_ROOT}/boot/efi/EFI" "${WORK_DIR}/efi_content/" 2>/dev/null || true
-
-                # 保存 EFI 设备路径
-                echo "$EFI_DEV" > "${WORK_DIR}/efi_device"
-
-                sync
-                umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
-
-                log_info "ARM64 UEFI GRUB 配置完成"
-            else
-                log_error "未找到 EFI 分区！"
-            fi
-        else
-            log_warn "ARM64 非 UEFI 模式，跳过 bootloader 配置"
+        BOOTLOADER="$OPTARG"
+        ;;
+    m)
+        mirrors="${mirrors:+$mirrors }$OPTARG"
+        ;;
+    n)
+        if [ "$OPTARG" != "systemd-networkd" ] && [ "$OPTARG" != "netctl" ] && [ "$OPTARG" != "none" ]; then
+            echo "无效的网络配置: $OPTARG" >&2
+            exit 1
         fi
-    fi
-}
+        NETWORK="$OPTARG"
+        ;;
+    h)
+        cat <<-EOF
+			用法: ${0##*/} [选项]
 
-#=============================================================================
-# 替换系统
-#=============================================================================
+			  选项:
+			    -b (grub|syslinux|none)           引导程序（默认: grub）
+			    -n (systemd-networkd|netctl|none)  网络配置（默认: systemd-networkd）
+			    -m 镜像地址                        镜像 URL（可多次指定）
+			    -h                                 显示此帮助
 
-replace_system() {
-    log_info "准备替换系统..."
-    log_warn "这是不可逆操作！5秒后开始..."
-    sleep 5
-
-    # 同步文件系统
-    sync
-
-    # 创建内存临时目录
-    RAMDIR="/srv/vps2arch_exec"
-
-    # 先卸载可能存在的旧挂载
-    umount "$RAMDIR" 2>/dev/null || true
-    rm -rf "$RAMDIR" 2>/dev/null || true
-
-    mkdir -p "$RAMDIR"
-    mount -t tmpfs -o size=200M tmpfs "$RAMDIR" || log_error "挂载 tmpfs 失败"
-    log_info "tmpfs 已挂载到 $RAMDIR"
-
-    # ========== 关键：处理 EFI 分区 ==========
-    EFI_PART_DEV=""
-    if [[ -d /sys/firmware/efi ]]; then
-        log_info "准备 EFI 分区数据..."
-
-        # 从 setup_bootloader 保存的文件读取 EFI 设备路径
-        if [[ -f "${WORK_DIR}/efi_device" ]]; then
-            EFI_PART_DEV=$(cat "${WORK_DIR}/efi_device")
-            log_info "EFI 分区设备（从配置读取）: $EFI_PART_DEV"
-        fi
-
-        # 如果没找到，尝试其他方法
-        if [[ -z "$EFI_PART_DEV" ]]; then
-            EFI_PART_DEV=$(findmnt -n -o SOURCE /boot/efi 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null | head -n1)
-        fi
-
-        if [[ -z "$EFI_PART_DEV" ]]; then
-            for dev in /dev/sda1 /dev/sda15 /dev/vda1 /dev/vda15 /dev/nvme0n1p1 /dev/nvme0n1p15; do
-                if [[ -b "$dev" ]] && [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == "vfat" ]]; then
-                    EFI_PART_DEV="$dev"
-                    break
-                fi
-            done
-        fi
-
-        if [[ -n "$EFI_PART_DEV" ]]; then
-            log_info "EFI 分区设备: $EFI_PART_DEV"
-
-            # 从 WORK_DIR 复制 EFI 备份到 RAMDIR（setup_bootloader 已经备份过）
-            log_info "复制 EFI 内容到内存..."
-            mkdir -p "$RAMDIR/efi_backup"
-
-            if [[ -d "${WORK_DIR}/efi_content/EFI" ]]; then
-                cp -a "${WORK_DIR}/efi_content/EFI" "$RAMDIR/efi_backup/"
-                log_info "从工作目录复制 EFI 内容成功"
-            else
-                log_warn "工作目录中没有 EFI 备份，尝试从挂载点获取..."
-                mkdir -p /tmp/efi_mount
-                mount "$EFI_PART_DEV" /tmp/efi_mount 2>/dev/null || true
-                if [[ -d /tmp/efi_mount/EFI ]]; then
-                    cp -a /tmp/efi_mount/EFI "$RAMDIR/efi_backup/"
-                    log_info "从挂载点复制 EFI 内容"
-                fi
-                umount /tmp/efi_mount 2>/dev/null || true
-            fi
-
-            # 验证备份
-            if [[ -d "$RAMDIR/efi_backup/EFI" ]]; then
-                log_info "EFI 备份内容:"
-                find "$RAMDIR/efi_backup" -type f 2>/dev/null | head -15
-            else
-                log_error "EFI 备份失败！无法继续"
-            fi
-
-            # 卸载所有 EFI 相关挂载点
-            umount "${NEW_ROOT}/boot/efi" 2>/dev/null || true
-            umount /boot/efi 2>/dev/null || true
-            umount /boot 2>/dev/null || true
-
-            log_info "EFI 数据已准备好"
-        else
-            log_error "未找到 EFI 分区！UEFI 系统无法启动"
-        fi
-    fi
-
-    # 保存 EFI 设备路径供 do_replace.sh 使用
-    echo "$EFI_PART_DEV" > "$RAMDIR/efi_device"
-
-    # 复制 busybox 到内存
-    log_info "复制 busybox 到内存..."
-    cp "${WORK_DIR}/busybox" "$RAMDIR/busybox" || log_error "复制 busybox 失败"
-    chmod +x "$RAMDIR/busybox"
-
-    # 如果是动态编译的 busybox，需要拷贝依赖库
-    if [[ "$BUSYBOX_STATIC" != "true" ]]; then
-        log_info "busybox 是动态编译，拷贝依赖库..."
-
-        # 获取动态链接器路径
-        LD_LINUX=""
-        for ld in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/ld-linux-aarch64.so.1 /lib64/ld-linux-aarch64.so.1; do
-            if [[ -f "$ld" ]]; then
-                LD_LINUX="$ld"
-                break
-            fi
-        done
-
-        if [[ -z "$LD_LINUX" ]]; then
-            log_error "找不到动态链接器"
-        fi
-
-        # 复制动态链接器
-        cp -L "$LD_LINUX" "$RAMDIR/ld-linux.so"
-        chmod +x "$RAMDIR/ld-linux.so"
-        log_info "已复制动态链接器: $LD_LINUX"
-
-        # 复制 busybox 的依赖库
-        mkdir -p "$RAMDIR/lib"
-        ldd "${WORK_DIR}/busybox" 2>/dev/null | while read line; do
-            # 提取库文件路径
-            lib=$(echo "$line" | grep -oE '/[^ ]+' | head -1)
-            if [[ -n "$lib" && -f "$lib" ]]; then
-                cp -L "$lib" "$RAMDIR/lib/" 2>/dev/null || true
-                log_info "  复制库: $(basename $lib)"
-            fi
-        done
-
-        # 设置库路径
-        export LD_LIBRARY_PATH="$RAMDIR/lib"
-        BUSYBOX_CMD="$RAMDIR/ld-linux.so --library-path $RAMDIR/lib $RAMDIR/busybox"
-    else
-        BUSYBOX_CMD="$RAMDIR/busybox"
-    fi
-
-    # 测试 busybox
-    log_info "测试 busybox..."
-    if ! $BUSYBOX_CMD echo "busybox test ok"; then
-        log_error "busybox 无法执行"
-    fi
-    log_info "busybox 测试通过"
-
-    # 创建替换脚本
-    if [[ "$BUSYBOX_STATIC" == "true" ]]; then
-        # 静态版本：直接使用 busybox
-        cat > "$RAMDIR/do_replace.sh" << 'REPLACE_SCRIPT'
-#!/srv/vps2arch_exec/busybox sh
-
-RAMDIR="/srv/vps2arch_exec"
-BB="$RAMDIR/busybox"
-REPLACE_SCRIPT
-    else
-        # 动态版本：使用动态链接器
-        cat > "$RAMDIR/do_replace.sh" << 'REPLACE_SCRIPT'
-#!/srv/vps2arch_exec/ld-linux.so --library-path /srv/vps2arch_exec/lib /srv/vps2arch_exec/busybox sh
-
-RAMDIR="/srv/vps2arch_exec"
-BB="$RAMDIR/ld-linux.so --library-path $RAMDIR/lib $RAMDIR/busybox"
-REPLACE_SCRIPT
-    fi
-
-    # 追加公共脚本内容
-    cat >> "$RAMDIR/do_replace.sh" << REPLACE_SCRIPT
-
-NEW_ROOT="$NEW_ROOT"
-EFI_DEV="\$(cat \$RAMDIR/efi_device 2>/dev/null)"
-
-echo "========== 开始系统替换 =========="
-
-# 验证新系统文件存在
-if [ ! -d "\${NEW_ROOT}/bin" ]; then
-    echo "错误: 新系统文件不存在，中止操作"
-    exit 1
-fi
-echo "新系统文件验证通过"
-
-# 切换到根目录
-cd /
-
-echo "删除旧系统文件..."
-# 删除旧系统文件（保留必要目录）
-for item in /*; do
-    case "\$item" in
-        /proc|/sys|/dev|/run|/tmp|/mnt|/srv)
-            continue
-            ;;
-        *)
-            echo "删除: \$item"
-            \$BB rm -rf "\$item" 2>/dev/null || true
-            ;;
+			  注意: OpenVZ 容器中将跳过引导程序安装，网络配置强制使用 netctl。
+		EOF
+        exit 0
+        ;;
+    :)
+        printf "%s: 选项需要参数 -- '%s'\n" "${0##*/}" "$OPTARG" >&2
+        exit 1
+        ;;
+    ?)
+        printf "%s: 无效选项 -- '%s'\n" "${0##*/}" "$OPTARG" >&2
+        exit 1
+        ;;
     esac
 done
+shift $((OPTIND - 1))
 
-echo "复制新系统..."
-# 复制新系统
-\$BB cp -a "\${NEW_ROOT}"/* /
-
-echo "同步磁盘..."
-\$BB sync
-
-# ========== 关键：恢复 EFI 分区内容 ==========
-if [ -n "\$EFI_DEV" ] && [ -d "\$RAMDIR/efi_backup/EFI" ]; then
-    echo "恢复 EFI 分区内容..."
-    echo "EFI 设备: \$EFI_DEV"
-
-    # 创建挂载点
-    \$BB mkdir -p /boot/efi
-
-    # 挂载 EFI 分区
-    \$BB mount -t vfat "\$EFI_DEV" /boot/efi
-    if [ \$? -eq 0 ]; then
-        echo "EFI 分区挂载成功"
-
-        # 清空 EFI 分区（保留 NvVars 等系统文件）
-        \$BB rm -rf /boot/efi/EFI 2>/dev/null || true
-
-        # 复制 EFI 内容
-        \$BB cp -a "\$RAMDIR/efi_backup/EFI" /boot/efi/
-        \$BB sync
-
-        # 验证
-        echo "EFI 分区恢复后内容:"
-        \$BB ls -la /boot/efi/EFI/ 2>/dev/null || echo "(无法列出)"
-        \$BB ls -la /boot/efi/EFI/BOOT/ 2>/dev/null || echo "(无法列出 BOOT)"
-
-        # 卸载
-        \$BB umount /boot/efi
-        echo "EFI 分区恢复完成"
-    else
-        echo "警告: EFI 分区挂载失败！"
-    fi
-else
-    echo "跳过 EFI 恢复（非 UEFI 或无备份）"
+# 兼容旧版位置参数传入镜像地址
+if [[ -z "$mirrors" && -n "$1" ]]; then
+    mirrors="$1"
 fi
 
-echo "最终同步..."
-\$BB sync
-\$BB sleep 1
-\$BB sync
+[ -z "$mirrors" ] && mirrors=$(get_worldwide_mirrors)
 
-# 重启
-echo "========== 系统替换完成 =========="
-echo "3秒后重启..."
-\$BB sleep 3
-echo b > /proc/sysrq-trigger
-REPLACE_SCRIPT
-
-    chmod +x "$RAMDIR/do_replace.sh"
-
-    # 卸载 chroot 挂载点
-    umount -l "${NEW_ROOT}/dev" 2>/dev/null || true
-    umount -l "${NEW_ROOT}/run" 2>/dev/null || true
-    umount -l "${NEW_ROOT}/sys" 2>/dev/null || true
-    umount -l "${NEW_ROOT}/proc" 2>/dev/null || true
-    umount -l "$NEW_ROOT" 2>/dev/null || true
-
-    # 执行替换
-    log_info "开始替换系统..."
-
-    if [[ "$BUSYBOX_STATIC" == "true" ]]; then
-        log_info "使用静态 busybox 执行替换脚本"
-        exec "$RAMDIR/busybox" sh "$RAMDIR/do_replace.sh"
-    else
-        log_info "使用动态 busybox + ld-linux 执行替换脚本"
-        exec "$RAMDIR/ld-linux.so" --library-path "$RAMDIR/lib" "$RAMDIR/busybox" sh "$RAMDIR/do_replace.sh"
-    fi
-}
+# 容器环境覆盖设置
+if is_openvz; then
+    BOOTLOADER=none
+    NETWORK=netctl
+elif is_lxc; then
+    BOOTLOADER=none
+fi
 
 #=============================================================================
-# 主函数
+# 主流程
 #=============================================================================
 
-main() {
-    echo "=============================================="
-    echo "    VPS to Arch Linux 转换脚本"
-    echo "=============================================="
-    echo ""
-    
-    log_warn "此脚本将完全替换当前系统为 Arch Linux"
-    log_warn "请确保已备份重要数据！"
-    echo ""
-    
-    read -p "确定要继续吗？(输入 YES 确认): " confirm
-    if [[ "$confirm" != "YES" ]]; then
-        log_info "操作已取消"
-        exit 0
-    fi
-    
-    # 执行检查
-    check_root
-    check_arch
-    check_virt
-    detect_os
+echo "=============================================="
+echo "    VPS 转换 Arch Linux 脚本"
+echo "=============================================="
+echo ""
+log_warn "此操作将完全替换当前系统为 Arch Linux！"
+echo ""
 
-    # 保存配置
-    save_network_config
-    save_ssh_config
-    
-    # 下载并配置
-    download_bootstrap
-    configure_new_system
-    setup_locale_timezone_alias
-    setup_network
-    setup_ssh
-    setup_fstab
-    setup_bootloader
-    
-    # 替换系统
-    replace_system
-}
+check_root
 
-# 运行主函数
-main "$@"
+cd /
+save_network_config
+save_ssh_keys
+download_and_extract_bootstrap
+configure_chroot
+save_root_pass
+backup_old_files
+delete_all
+install_packages
+restore_root_pass
+cleanup
+configure_bootloader
+configure_network
+configure_ssh
+configure_system
+finalize
